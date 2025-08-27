@@ -174,14 +174,21 @@ async def satellite(
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
     # 2) send to OpenAI and return the text
-    prompt = (
-        "Analyze the satellite image. Focus ONLY on buildings inside the red circle and determine if there are solar panels on any roofs.\n"
-        "Return ONLY a JSON object with exactly these keys and formats:\n"
-        "{ \"solar_panels\": \"yes\" | \"no\", \"reasoning\": \"short explanation\" }\n"
-        "Rules:\n"
-        "- solar_panels must be exactly \"yes\" or \"no\".\n"
-        "- reasoning should be 1-2 concise sentences.\n"
-        "- Output the JSON only, with no extra text."
-    )
+    prompt = ("""You are an expert in analyzing satellite images.
+Your task is to examine the provided satellite photo and determine:
+1. Whether solar panels are present.
+2. Whether there are flat rooftops suitable for placing solar panels.
+
+Instructions:
+- For solar panels, look for rectangular dark-blue/black areas with a grid-like texture, often arranged in rows. They may be found on rooftops or in large open ground installations.
+- For flat rooftops, look for rooftops of buildings with a flat geometry (not pitched/sloped).
+- Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
+
+Provide the output strictly in the following JSON format:
+{
+  "solar_panels": "yes/no",
+  "flat_surface": "yes/no",
+  "reasoning": "short explanation of why you answered yes or no"
+}""")
     text = analyze_image_bytes_with_openai(img_bytes, prompt)
     return {"model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "result": text}
