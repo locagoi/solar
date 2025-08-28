@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, Query
 
 # ---------- OpenAI ----------
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,31 @@ def analyze_image_bytes_with_openai(image_bytes: bytes, prompt: str, model: str 
         return getattr(resp, "output_text", None) or str(resp)
     except Exception as e:
         logger.exception("OpenAI request failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
+
+async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> str:
+    """
+    Async variant that avoids blocking the event loop during OpenAI network I/O.
+    """
+    data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.responses.create(
+            model=model,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }],
+        )
+        return getattr(resp, "output_text", None) or str(resp)
+    except Exception as e:
+        logger.exception("OpenAI async request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
 # ---------- Google Maps ----------
@@ -216,7 +241,7 @@ Provide the output strictly in the following JSON format:
   "flat_surface": "yes/no",
   "reasoning": "short explanation of why you answered yes or no"
 }""")
-    text = analyze_image_bytes_with_openai(img_bytes, prompt, model)
+    text = await analyze_image_bytes_with_openai_async(img_bytes, prompt, model)
     
     # Parse the JSON response from OpenAI
     try:
