@@ -3,6 +3,7 @@ import re
 import math
 import base64
 import httpx
+import json
 
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
@@ -191,4 +192,32 @@ Provide the output strictly in the following JSON format:
   "reasoning": "short explanation of why you answered yes or no"
 }""")
     text = analyze_image_bytes_with_openai(img_bytes, prompt, model)
-    return {"model": model, "result": text}
+    
+    # Parse the JSON response from OpenAI
+    try:
+        # Extract the result part if it's wrapped in a larger response
+        if isinstance(text, str):
+            # Try to parse as JSON first
+            try:
+                parsed = json.loads(text)
+                # If it has a "result" key, use that; otherwise use the whole response
+                if "result" in parsed:
+                    result_data = json.loads(parsed["result"])
+                else:
+                    result_data = parsed
+            except json.JSONDecodeError:
+                # If the whole text isn't valid JSON, try to extract JSON from within
+                # Look for JSON-like content between curly braces
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    result_data = json.loads(json_match.group())
+                else:
+                    # Fallback: return the raw text
+                    result_data = {"raw_response": text}
+        else:
+            result_data = text
+            
+        return {"model": model, "result": result_data}
+    except Exception as e:
+        # If parsing fails, return the raw response
+        return {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
