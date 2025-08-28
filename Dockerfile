@@ -38,5 +38,6 @@ EXPOSE 8000
 # Healthcheck (hit /health)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
-# Run uvicorn directly
-CMD ["/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run uvicorn directly with access log enabled; control app log level via LOG_LEVEL env
+ENV LOG_LEVEL=INFO
+CMD ["/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--access-log"]

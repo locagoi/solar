@@ -4,6 +4,7 @@ import math
 import base64
 import httpx
 import json
+import logging
 
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
@@ -12,6 +13,8 @@ from fastapi import APIRouter, HTTPException, Query
 
 # ---------- OpenAI ----------
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 def _get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -41,6 +44,7 @@ def analyze_image_bytes_with_openai(image_bytes: bytes, prompt: str, model: str 
         # Prefer output_text if available; otherwise fall back to stringifying.
         return getattr(resp, "output_text", None) or str(resp)
     except Exception as e:
+        logger.exception("OpenAI request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
 # ---------- Google Maps ----------
@@ -83,10 +87,21 @@ def extract_coords_from_url(url: str):
 async def resolve_place_id_to_coords(place_id: str, api_key: str, client: httpx.AsyncClient):
     url = f"{GOOGLE_BASE}/place/details/json"
     params = {"place_id": place_id, "fields": "geometry", "key": api_key}
-    r = await client.get(url, params=params, timeout=30.0)
-    r.raise_for_status()
+    try:
+        r = await client.get(url, params=params, timeout=30.0)
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "Google Place Details HTTP error: status=%s url=%s params=%s body=%s",
+            getattr(e.response, "status_code", "?"), url, params, getattr(e.response, "text", ""),
+        )
+        raise HTTPException(status_code=502, detail=f"Place Details HTTP error: {e}")
+    except httpx.RequestError as e:
+        logger.error("Google Place Details request error: url=%s params=%s err=%s", url, params, e)
+        raise HTTPException(status_code=502, detail=f"Place Details request error: {e}")
     data = r.json()
     if data.get("status") != "OK":
+        logger.error("Place Details API returned non-OK: status=%s data=%s", data.get("status"), data)
         raise HTTPException(status_code=502, detail=f"Place Details error: {data}")
     loc = data["result"]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
@@ -124,8 +139,18 @@ async def fetch_static_satellite(
         r = await client.get("/staticmap", params=params, timeout=30.0)
         r.raise_for_status()
         if r.headers.get("Content-Type", "").startswith("application/json"):
+            logger.error("Static Maps API returned JSON error: %s", r.text)
             raise HTTPException(status_code=502, detail=f"Static Maps API error: {r.text}")
         return r.content
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            "Static Maps HTTP error: status=%s url=%s params=%s body=%s",
+            getattr(e.response, "status_code", "?"), f"{GOOGLE_BASE}/staticmap", params, getattr(e.response, "text", ""),
+        )
+        raise HTTPException(status_code=502, detail=f"Static Maps HTTP error: {e}")
+    except httpx.RequestError as e:
+        logger.error("Static Maps request error: url=%s params=%s err=%s", f"{GOOGLE_BASE}/staticmap", params, e)
+        raise HTTPException(status_code=502, detail=f"Static Maps request error: {e}")
     finally:
         if close_after:
             await client.aclose()
