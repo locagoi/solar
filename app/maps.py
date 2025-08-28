@@ -18,12 +18,11 @@ def _get_openai_client() -> OpenAI:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
     return OpenAI(api_key=api_key)
 
-def analyze_image_bytes_with_openai(image_bytes: bytes, prompt: str) -> str:
+def analyze_image_bytes_with_openai(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> str:
     """
     Send a PNG (bytes) + prompt to OpenAI Responses API and return text.
     Uses a base64 data URL so no hosting is needed.
     """
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
 
     try:
@@ -141,6 +140,7 @@ async def satellite(
     scale: int = Query(default=2, ge=1, le=2),
     circle_radius: int | None = Query(default=None, ge=1, description="Optional circle radius (meters)"),
     preview: bool = False,
+    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
 ):
     gkey = os.getenv("GOOGLE_MAPS_API_KEY")
     if not gkey:
@@ -190,5 +190,5 @@ Provide the output strictly in the following JSON format:
   "flat_surface": "yes/no",
   "reasoning": "short explanation of why you answered yes or no"
 }""")
-    text = analyze_image_bytes_with_openai(img_bytes, prompt)
-    return {"model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"), "result": text}
+    text = analyze_image_bytes_with_openai(img_bytes, prompt, model)
+    return {"model": model, "result": text}
