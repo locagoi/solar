@@ -42,6 +42,8 @@ async def _get_shared_browser_and_page():
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
             _page = await _browser.new_page()
+            # Set device scale factor only once when page is created
+            await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
             logger.info("Shared browser and page instance created")
         return _browser, _page
 
@@ -407,7 +409,6 @@ async def capture_satellite_with_playwright(
             
             # Reuse the same page for each request
             await page.set_viewport_size({"width": size_px, "height": size_px})
-            await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
             await page.set_content(html_content)
             
             # Wait for the map to load (wait for the map div to be populated)
