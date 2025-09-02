@@ -300,6 +300,7 @@ async def capture_satellite_with_playwright(
     Capture satellite view using Playwright browser automation.
     This provides local browser control without external service dependencies.
     """
+    start_time = asyncio.get_event_loop().time()
     try:
         # Get Google Maps API key from environment
         google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
@@ -409,13 +410,16 @@ async def capture_satellite_with_playwright(
                     clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
                 )
                 
+                duration = asyncio.get_event_loop().time() - start_time
+                logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
                 return screenshot_bytes
                 
             finally:
                 await browser.close()
                 
     except Exception as e:
-        logger.exception("Playwright capture failed: %s", e)
+        duration = asyncio.get_event_loop().time() - start_time
+        logger.error(f"Playwright failed after {duration:.1f}s: {type(e).__name__}: {str(e)}")
         raise HTTPException(status_code=502, detail=f"Playwright capture error: {e}")
 
 # ---------- Single endpoint: build image -> send to OpenAI -> return text ----------
