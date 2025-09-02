@@ -18,30 +18,32 @@ from openai import OpenAI, AsyncOpenAI
 # ---------- Playwright ----------
 from playwright.async_api import async_playwright
 
-# Global browser instance - only one browser for all requests
+# Global browser instance - only one browser and one page for all requests
 _playwright = None
 _browser = None
+_page = None
 _browser_lock = asyncio.Lock()
 
-# Strict concurrency limit for 512MB RAM
-playwright_semaphore = asyncio.Semaphore(2)  # Max 2 concurrent requests
+# Ultra-strict concurrency limit for 512MB RAM - only 1 request at a time
+playwright_semaphore = asyncio.Semaphore(1)  # Max 1 concurrent request
 
 logger = logging.getLogger(__name__)
 
-async def _get_shared_browser():
-    """Get or create a shared browser instance."""
-    global _playwright, _browser
+async def _get_shared_browser_and_page():
+    """Get or create a shared browser and page instance."""
+    global _playwright, _browser, _page
     
     async with _browser_lock:
         if _browser is None:
-            logger.info("Creating shared browser instance")
+            logger.info("Creating shared browser and page instance")
             _playwright = await async_playwright().start()
             _browser = await _playwright.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             )
-            logger.info("Shared browser instance created")
-        return _browser
+            _page = await _browser.new_page()
+            logger.info("Shared browser and page instance created")
+        return _browser, _page
 
 def _get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -399,39 +401,34 @@ async def capture_satellite_with_playwright(
   </body>
 </html>"""
         
-        # Use shared browser instance with strict concurrency limit
+        # Use shared browser and page instance with strict concurrency limit
         async with playwright_semaphore:
-            browser = await _get_shared_browser()
+            browser, page = await _get_shared_browser_and_page()
             
-            try:
-                page = await browser.new_page()
-                await page.set_viewport_size({"width": size_px, "height": size_px})
-                await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
-                await page.set_content(html_content)
-                
-                # Wait for the map to load (wait for the map div to be populated)
-                await page.wait_for_function(
-                    "() => window.map && document.querySelector('#map').children.length > 0",
-                    timeout=10000
-                )
-                
-                # Additional wait to ensure tiles are loaded
-                await page.wait_for_timeout(3000)
-                
-                # Take screenshot
-                screenshot_bytes = await page.screenshot(
-                    type="png",
-                    full_page=False,
-                    clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
-                )
-                
-                duration = asyncio.get_event_loop().time() - start_time
-                logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
-                return screenshot_bytes
-                
-            finally:
-                # Close only the page, keep the browser
-                await page.close()
+            # Reuse the same page for each request
+            await page.set_viewport_size({"width": size_px, "height": size_px})
+            await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
+            await page.set_content(html_content)
+            
+            # Wait for the map to load (wait for the map div to be populated)
+            await page.wait_for_function(
+                "() => window.map && document.querySelector('#map').children.length > 0",
+                timeout=10000
+            )
+            
+            # Additional wait to ensure tiles are loaded
+            await page.wait_for_timeout(3000)
+            
+            # Take screenshot
+            screenshot_bytes = await page.screenshot(
+                type="png",
+                full_page=False,
+                clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
+            )
+            
+            duration = asyncio.get_event_loop().time() - start_time
+            logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
+            return screenshot_bytes
                 
     except Exception as e:
         duration = asyncio.get_event_loop().time() - start_time
