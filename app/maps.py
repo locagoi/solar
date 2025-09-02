@@ -15,6 +15,9 @@ from fastapi import APIRouter, HTTPException, Query
 # ---------- OpenAI ----------
 from openai import OpenAI, AsyncOpenAI
 
+# ---------- Playwright ----------
+from playwright.async_api import async_playwright
+
 logger = logging.getLogger(__name__)
 
 def _get_openai_client() -> OpenAI:
@@ -284,6 +287,137 @@ async def capture_satellite_with_browserless(
         logger.exception("Browserless capture failed: %s", e)
         raise HTTPException(status_code=502, detail=f"Browserless capture error: {e}")
 
+# ---------- Playwright satellite capture ----------
+async def capture_satellite_with_playwright(
+    lat: float,
+    lng: float,
+    *,
+    zoom: int = 18,
+    size_px: int = 500,
+    circle_radius: int | None = None,
+) -> bytes:
+    """
+    Capture satellite view using Playwright browser automation.
+    This provides local browser control without external service dependencies.
+    """
+    try:
+        # Get Google Maps API key from environment
+        google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+        
+        if not google_maps_api_key:
+            raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
+        
+        # Create HTML content with the specified coordinates
+        html_content = f"""<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Satellite Map</title>
+    <style>
+      html, body {{ height: 100%; margin: 0; padding: 0; }}
+      #map {{ width: 100vw; height: 100vh; }}
+      .circle-overlay {{
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: {circle_radius * 2 if circle_radius else 0}px;
+        height: {circle_radius * 2 if circle_radius else 0}px;
+        border: 5px solid #FF0000;
+        border-radius: 50%;
+        background-color: rgba(255, 0, 0, 0.3);
+        pointer-events: none;
+        z-index: 1000;
+      }}
+    </style>
+    <script>
+      let map;
+      async function initMap() {{
+        const {{ Map, MapTypeId, Circle }} = await google.maps.importLibrary("maps");
+
+        const center = {{ lat: {lat}, lng: {lng} }};
+        const zoom = {zoom};
+
+        map = new Map(document.getElementById("map"), {{
+          center,
+          zoom,
+          mapTypeId: MapTypeId.SATELLITE,
+          tilt: 0,
+          heading: 0,
+          disableDefaultUI: true,
+        }});
+        
+        {f'''
+        // Add circle overlay if requested
+        if ({bool(circle_radius)}) {{
+          new Circle({{
+            strokeColor: "#FF0000",
+            strokeOpacity: 1.0,
+            strokeWeight: 5,
+            fillColor: "#FF0000",
+            fillOpacity: 0.3,
+            map,
+            center,
+            radius: {circle_radius},
+          }});
+        }}
+        ''' if circle_radius else ''}
+      }}
+      window.initMap = initMap;
+    </script>
+    <script async
+      src="https://maps.googleapis.com/maps/api/js?key={google_maps_api_key}&callback=initMap&v=weekly">
+    </script>
+  </head>
+  <body>
+    <div id="map"></div>
+    {f'<div class="circle-overlay"></div>' if circle_radius else ''}
+  </body>
+</html>"""
+        
+        # Use Playwright to render the HTML and take a screenshot
+        async with async_playwright() as p:
+            # Launch browser (headless by default)
+            browser = await p.chromium.launch(headless=True)
+            
+            try:
+                # Create a new page
+                page = await browser.new_page()
+                
+                # Set viewport size
+                await page.set_viewport_size({"width": size_px, "height": size_px})
+                
+                # Set device scale factor for higher resolution
+                await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
+                
+                # Set the HTML content
+                await page.set_content(html_content)
+                
+                # Wait for the map to load (wait for the map div to be populated)
+                await page.wait_for_function(
+                    "() => window.map && document.querySelector('#map').children.length > 0",
+                    timeout=10000
+                )
+                
+                # Additional wait to ensure tiles are loaded
+                await page.wait_for_timeout(3000)
+                
+                # Take screenshot
+                screenshot_bytes = await page.screenshot(
+                    type="png",
+                    full_page=False,
+                    clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
+                )
+                
+                return screenshot_bytes
+                
+            finally:
+                await browser.close()
+                
+    except Exception as e:
+        logger.exception("Playwright capture failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"Playwright capture error: {e}")
+
 # ---------- Single endpoint: build image -> send to OpenAI -> return text ----------
 @router.get("/satellite", summary="Capture satellite image using browserless.io service")
 async def satellite(
@@ -324,6 +458,94 @@ async def satellite(
 
     # Capture satellite image using browserless
     img_bytes = await capture_satellite_with_browserless(
+        use_lat, use_lng,
+        zoom=zoom, size_px=size_px, circle_radius=circle_radius
+    )
+
+    if preview:
+        return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
+
+    # Send to OpenAI and return the text (reuse existing prompt)
+    prompt = ("""You are an expert in analyzing satellite images.
+Your task is to examine the provided satellite photo and determine:
+1. Whether solar panels are present.
+2. Whether there are flat rooftops suitable for placing solar panels.
+
+Instructions:
+- For solar panels, look for rectangular dark-blue/black areas with a grid-like texture, often arranged in rows. They may be found on rooftops or in large open ground installations.
+- For flat rooftops, look for rooftops of buildings with a flat geometry (not pitched/sloped).
+- Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
+
+Provide the output strictly in the following JSON format:
+{
+  "solar_panels": "yes/no",
+  "flat_surface": "yes/no",
+  "reasoning": "short explanation of why you answered yes or no"
+}""")
+    
+    text = await analyze_image_bytes_with_openai_async(img_bytes, prompt, model)
+    
+    # Parse the JSON response from OpenAI (reuse existing logic)
+    try:
+        if isinstance(text, str):
+            try:
+                parsed = json.loads(text)
+                if "result" in parsed:
+                    result_data = json.loads(parsed["result"])
+                else:
+                    result_data = parsed
+            except json.JSONDecodeError:
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    result_data = json.loads(json_match.group())
+                else:
+                    result_data = {"raw_response": text}
+        else:
+            result_data = text
+            
+        return {"model": model, "result": result_data}
+    except Exception as e:
+        return {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
+
+@router.get("/satellite-playwright", summary="Capture satellite image using Playwright browser automation")
+async def satellite_playwright(
+    url: str | None = Query(default=None, description="Google Maps URL (supports @lat,lng, place_id, or q=...)"),
+    lat: float | None = Query(default=None, description="Latitude if no URL provided"),
+    lng: float | None = Query(default=None, description="Longitude if no URL provided"),
+    zoom: int = Query(default=18, ge=0, le=21),
+    size_px: int = Query(default=1000, ge=1, le=1280),
+    circle_radius: int | None = Query(default=None, ge=1, description="Optional circle radius (meters)"),
+    preview: bool = False,
+    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+):
+    """
+    Capture satellite view using Playwright browser automation.
+    This provides local browser control without external service dependencies.
+    """
+    # figure out coordinates (reuse existing logic)
+    if url:
+        try:
+            parsed = extract_coords_from_url(url)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if isinstance(parsed, tuple) and len(parsed) == 2 and isinstance(parsed[0], float):
+            use_lat, use_lng = parsed
+        elif isinstance(parsed, tuple) and parsed[0] == "place_id":
+            # For place_id, we still need Google Maps API key
+            gkey = os.getenv("GOOGLE_MAPS_API_KEY")
+            if not gkey:
+                raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is required for place_id resolution")
+            async with httpx.AsyncClient() as c:
+                use_lat, use_lng = await resolve_place_id_to_coords(parsed[1], gkey, c)
+        else:
+            raise HTTPException(status_code=400, detail="Unrecognized URL format.")
+    else:
+        if lat is None or lng is None:
+            raise HTTPException(status_code=400, detail="Provide either 'url' or both 'lat' and 'lng'.")
+        use_lat, use_lng = float(lat), float(lng)
+
+    # Capture satellite image using Playwright
+    img_bytes = await capture_satellite_with_playwright(
         use_lat, use_lng,
         zoom=zoom, size_px=size_px, circle_radius=circle_radius
     )
