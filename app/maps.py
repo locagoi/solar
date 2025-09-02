@@ -18,7 +18,27 @@ from openai import OpenAI, AsyncOpenAI
 # ---------- Playwright ----------
 from playwright.async_api import async_playwright
 
+# Global browser instance - only one browser for all requests
+_playwright = None
+_browser = None
+_browser_lock = asyncio.Lock()
+
 logger = logging.getLogger(__name__)
+
+async def _get_shared_browser():
+    """Get or create a shared browser instance."""
+    global _playwright, _browser
+    
+    async with _browser_lock:
+        if _browser is None:
+            logger.info("Creating shared browser instance")
+            _playwright = await async_playwright().start()
+            _browser = await _playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            )
+            logger.info("Shared browser instance created")
+        return _browser
 
 def _get_openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY")
@@ -376,46 +396,38 @@ async def capture_satellite_with_playwright(
   </body>
 </html>"""
         
-        # Use Playwright to render the HTML and take a screenshot
-        async with async_playwright() as p:
-            # Launch browser (headless by default)
-            browser = await p.chromium.launch(headless=True)
+        # Use shared browser instance
+        browser = await _get_shared_browser()
+        
+        try:
+            page = await browser.new_page()
+            await page.set_viewport_size({"width": size_px, "height": size_px})
+            await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
+            await page.set_content(html_content)
             
-            try:
-                # Create a new page
-                page = await browser.new_page()
-                
-                # Set viewport size
-                await page.set_viewport_size({"width": size_px, "height": size_px})
-                
-                # Set device scale factor for higher resolution
-                await page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
-                
-                # Set the HTML content
-                await page.set_content(html_content)
-                
-                # Wait for the map to load (wait for the map div to be populated)
-                await page.wait_for_function(
-                    "() => window.map && document.querySelector('#map').children.length > 0",
-                    timeout=10000
-                )
-                
-                # Additional wait to ensure tiles are loaded
-                await page.wait_for_timeout(3000)
-                
-                # Take screenshot
-                screenshot_bytes = await page.screenshot(
-                    type="png",
-                    full_page=False,
-                    clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
-                )
-                
-                duration = asyncio.get_event_loop().time() - start_time
-                logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
-                return screenshot_bytes
-                
-            finally:
-                await browser.close()
+            # Wait for the map to load (wait for the map div to be populated)
+            await page.wait_for_function(
+                "() => window.map && document.querySelector('#map').children.length > 0",
+                timeout=10000
+            )
+            
+            # Additional wait to ensure tiles are loaded
+            await page.wait_for_timeout(3000)
+            
+            # Take screenshot
+            screenshot_bytes = await page.screenshot(
+                type="png",
+                full_page=False,
+                clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
+            )
+            
+            duration = asyncio.get_event_loop().time() - start_time
+            logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
+            return screenshot_bytes
+            
+        finally:
+            # Close only the page, keep the browser
+            await page.close()
                 
     except Exception as e:
         duration = asyncio.get_event_loop().time() - start_time
