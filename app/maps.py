@@ -23,6 +23,7 @@ _playwright = None
 _browser = None
 _page = None
 _browser_lock = asyncio.Lock()
+_request_count = 0
 
 # Ultra-strict concurrency limit for 512MB RAM - only 1 request at a time
 playwright_semaphore = asyncio.Semaphore(1)  # Max 1 concurrent request
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 async def _get_shared_browser_and_page():
     """Get or create a shared browser and page instance."""
-    global _playwright, _browser, _page
+    global _playwright, _browser, _page, _request_count
     
     async with _browser_lock:
         if _browser is None:
@@ -45,6 +46,15 @@ async def _get_shared_browser_and_page():
             # Set device scale factor only once when page is created
             await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
             logger.info("Shared browser and page instance created")
+        
+        # Recreate page every 5 requests to prevent memory accumulation
+        if _request_count % 5 == 0 and _request_count > 0:
+            logger.info(f"Recreating page after {_request_count} requests")
+            await _page.close()
+            _page = await _browser.new_page()
+            await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
+        
+        _request_count += 1
         return _browser, _page
 
 def _get_openai_client() -> OpenAI:
