@@ -409,6 +409,11 @@ async def capture_satellite_with_playwright(
             
             # Reuse the same page for each request
             await page.set_viewport_size({"width": size_px, "height": size_px})
+            
+            # Clear page state to prevent memory accumulation
+            await page.evaluate("() => { window.map = null; }")
+            await page.goto("about:blank")  # Clear the page completely
+            
             await page.set_content(html_content)
             
             # Wait for the map to load (wait for the map div to be populated)
