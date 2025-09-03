@@ -47,14 +47,24 @@ async def _get_shared_browser_and_page():
             await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
             logger.info("Shared browser and page instance created")
         
-        # Recreate page every 5 requests to prevent memory accumulation
-        if _request_count % 5 == 0 and _request_count > 0:
-            logger.info(f"Recreating page after {_request_count} requests")
+        # Recreate browser every 5 requests to prevent memory accumulation
+        _request_count += 1
+        logger.debug(f"Request count: {_request_count}")
+        if _request_count % 5 == 0:
+            logger.info(f"Recreating browser after {_request_count} requests")
             await _page.close()
+            await _browser.close()
+            await _playwright.stop()
+            
+            # Create fresh browser and page
+            _playwright = await async_playwright().start()
+            _browser = await _playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            )
             _page = await _browser.new_page()
             await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
-        
-        _request_count += 1
+            logger.info("Fresh browser and page created")
         return _browser, _page
 
 def _get_openai_client() -> OpenAI:
