@@ -23,16 +23,29 @@ _playwright = None
 _browser = None
 _page = None
 _browser_lock = asyncio.Lock()
-_request_count = 0
 
 # Ultra-strict concurrency limit for 512MB RAM - only 1 request at a time
 playwright_semaphore = asyncio.Semaphore(1)  # Max 1 concurrent request
 
 logger = logging.getLogger(__name__)
 
+def _log_memory(step: str):
+    """Log current memory usage for debugging."""
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        rss_mb = round(memory_info.rss / 1024 / 1024, 2)
+        vms_mb = round(memory_info.vms / 1024 / 1024, 2)
+        percent = round(process.memory_percent(), 2)
+        logger.info(f"Memory [{step}]: RSS={rss_mb}MB, VMS={vms_mb}MB, {percent}%")
+    except Exception as e:
+        logger.warning(f"Memory logging failed: {e}")
+
 async def _get_shared_browser_and_page():
     """Get or create a shared browser and page instance."""
-    global _playwright, _browser, _page, _request_count
+    global _playwright, _browser, _page
     
     async with _browser_lock:
         if _browser is None:
@@ -46,25 +59,6 @@ async def _get_shared_browser_and_page():
             # Set device scale factor only once when page is created
             await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
             logger.info("Shared browser and page instance created")
-        
-        # Recreate browser every 5 requests to prevent memory accumulation
-        _request_count += 1
-        logger.debug(f"Request count: {_request_count}")
-        if _request_count % 5 == 0:
-            logger.info(f"Recreating browser after {_request_count} requests")
-            await _page.close()
-            await _browser.close()
-            await _playwright.stop()
-            
-            # Create fresh browser and page
-            _playwright = await async_playwright().start()
-            _browser = await _playwright.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            )
-            _page = await _browser.new_page()
-            await _page.evaluate("() => { Object.defineProperty(screen, 'devicePixelRatio', { get: () => 2 }); }")
-            logger.info("Fresh browser and page created")
         return _browser, _page
 
 def _get_openai_client() -> OpenAI:
@@ -348,12 +342,16 @@ async def capture_satellite_with_playwright(
     This provides local browser control without external service dependencies.
     """
     start_time = asyncio.get_event_loop().time()
+    _log_memory("START")
+    
     try:
         # Get Google Maps API key from environment
         google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         
         if not google_maps_api_key:
             raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
+        
+        _log_memory("API_KEY_CHECK")
         
         # Create HTML content with the specified coordinates
         html_content = f"""<!DOCTYPE html>
@@ -425,25 +423,32 @@ async def capture_satellite_with_playwright(
         
         # Use shared browser and page instance with strict concurrency limit
         async with playwright_semaphore:
+            _log_memory("SEMAPHORE_ACQUIRED")
             browser, page = await _get_shared_browser_and_page()
+            _log_memory("BROWSER_OBTAINED")
             
             # Reuse the same page for each request
             await page.set_viewport_size({"width": size_px, "height": size_px})
+            _log_memory("VIEWPORT_SET")
             
             # Clear page state to prevent memory accumulation
             await page.evaluate("() => { window.map = null; }")
             await page.goto("about:blank")  # Clear the page completely
+            _log_memory("PAGE_CLEARED")
             
             await page.set_content(html_content)
+            _log_memory("HTML_SET")
             
             # Wait for the map to load (wait for the map div to be populated)
             await page.wait_for_function(
                 "() => window.map && document.querySelector('#map').children.length > 0",
                 timeout=10000
             )
+            _log_memory("MAP_LOADED")
             
             # Additional wait to ensure tiles are loaded
             await page.wait_for_timeout(3000)
+            _log_memory("TILES_LOADED")
             
             # Take screenshot
             screenshot_bytes = await page.screenshot(
@@ -451,6 +456,7 @@ async def capture_satellite_with_playwright(
                 full_page=False,
                 clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
             )
+            _log_memory("SCREENSHOT_TAKEN")
             
             duration = asyncio.get_event_loop().time() - start_time
             logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
