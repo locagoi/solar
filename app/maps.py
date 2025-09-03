@@ -6,6 +6,7 @@ import httpx
 import json
 import logging
 import asyncio
+import gc
 
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
@@ -457,6 +458,10 @@ async def capture_satellite_with_playwright(
                 clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
             )
             _log_memory("SCREENSHOT_TAKEN")
+            
+            # Python-level memory cleanup
+            gc.collect()  # Force Python garbage collection
+            _log_memory("PYTHON_GC")
             
             duration = asyncio.get_event_loop().time() - start_time
             logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
