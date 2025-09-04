@@ -345,17 +345,13 @@ async def capture_satellite_with_playwright(
     start_time = asyncio.get_event_loop().time()
     _log_memory("START")
     
-    try:
-        # Get Google Maps API key from environment
-        google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-        
-        if not google_maps_api_key:
-            raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
-        
-        _log_memory("API_KEY_CHECK")
-        
-        # Create HTML content with the specified coordinates
-        html_content = f"""<!DOCTYPE html>
+    # Get Google Maps API key from environment
+    google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if not google_maps_api_key:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
+
+    # Create HTML content with the specified coordinates
+    html_content = f"""<!DOCTYPE html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -378,7 +374,7 @@ async def capture_satellite_with_playwright(
       }}
     </style>
     <script>
-      let map;
+      var map;
       async function initMap() {{
         const {{ Map, MapTypeId, Circle }} = await google.maps.importLibrary("maps");
 
@@ -393,6 +389,9 @@ async def capture_satellite_with_playwright(
           heading: 0,
           disableDefaultUI: true,
         }});
+        
+        // Set window.map for reliable detection
+        window.map = map;
         
         {f'''
         // Add circle overlay if requested
@@ -421,56 +420,53 @@ async def capture_satellite_with_playwright(
     {f'<div class="circle-overlay"></div>' if circle_radius else ''}
   </body>
 </html>"""
+
+    async with playwright_semaphore:
+        browser, _ = await _get_shared_browser_and_page()  # keep single browser
+
+        # NEW: short-lived, incognito context & page per request
+        context = await browser.new_context(
+            viewport={"width": size_px, "height": size_px},
+            device_scale_factor=1,  # sharper output
+        )
+        page = await context.new_page()
         
-        # Use shared browser and page instance with strict concurrency limit
-        async with playwright_semaphore:
-            _log_memory("SEMAPHORE_ACQUIRED")
-            browser, page = await _get_shared_browser_and_page()
-            _log_memory("BROWSER_OBTAINED")
-            
-            # Reuse the same page for each request
-            await page.set_viewport_size({"width": size_px, "height": size_px})
-            _log_memory("VIEWPORT_SET")
-            
-            # Clear page state to prevent memory accumulation
-            await page.evaluate("() => { window.map = null; }")
-            await page.goto("about:blank")  # Clear the page completely
-            _log_memory("PAGE_CLEARED")
-            
-            await page.set_content(html_content)
-            _log_memory("HTML_SET")
-            
-            # Wait for the map to load (wait for the map div to be populated)
+        try:
+            await page.set_content(html_content, wait_until="domcontentloaded", timeout=15000)
+
+            # FIX: Wait for tiles using DOM-based signal
             await page.wait_for_function(
-                "() => window.map && document.querySelector('#map').children.length > 0",
+                "() => document.querySelector('#map') && "
+                "document.querySelector('#map').children.length > 0",
                 timeout=10000
             )
-            _log_memory("MAP_LOADED")
             
-            # Additional wait to ensure tiles are loaded
-            await page.wait_for_timeout(3000)
-            _log_memory("TILES_LOADED")
-            
+            await page.wait_for_timeout(1500)  # small extra settle
+
             # Take screenshot
             screenshot_bytes = await page.screenshot(
                 type="png",
                 full_page=False,
                 clip={"x": 0, "y": 0, "width": size_px, "height": size_px}
             )
-            _log_memory("SCREENSHOT_TAKEN")
             
             # Python-level memory cleanup
             gc.collect()  # Force Python garbage collection
-            _log_memory("PYTHON_GC")
             
             duration = asyncio.get_event_loop().time() - start_time
             logger.info(f"Playwright success: {duration:.1f}s, {len(screenshot_bytes)} bytes")
             return screenshot_bytes
-                
-    except Exception as e:
-        duration = asyncio.get_event_loop().time() - start_time
-        logger.error(f"Playwright failed after {duration:.1f}s: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Playwright capture error: {e}")
+            
+        finally:
+            # CRITICAL: free resources deterministically
+            try:
+                await page.close()
+            except:  # noqa
+                pass
+            try:
+                await context.close()
+            except:  # noqa
+                pass
 
 # ---------- Single endpoint: build image -> send to OpenAI -> return text ----------
 @router.get("/satellite", summary="Capture satellite image using browserless.io service")
