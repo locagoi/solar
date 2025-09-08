@@ -97,19 +97,28 @@ async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str,
 router = APIRouter(prefix="/maps", tags=["maps"])
 GOOGLE_BASE = "https://maps.googleapis.com/maps/api"
 
-def make_circle_path(lat: float, lng: float, radius_m: int = 200, num_points: int = 60) -> str:
-    R = 6378137.0
-    lat_rad = math.radians(lat)
-    lng_rad = math.radians(lng)
-    coords = []
-    for i in range(num_points):
-        angle = 2 * math.pi * i / num_points
-        dlat = (radius_m / R) * math.cos(angle)
-        dlng = (radius_m / (R * math.cos(lat_rad))) * math.sin(angle)
-        lat_i = lat_rad + dlat
-        lng_i = lng_rad + dlng
-        coords.append(f"{math.degrees(lat_i)},{math.degrees(lng_i)}")
-    return "|".join(coords)
+# OpenAI prompt for satellite image analysis
+SATELLITE_ANALYSIS_PROMPT = """You are an expert in analyzing satellite images.
+Your task is to examine the provided satellite photo and determine:
+1. Whether solar panels are present.
+2. Whether there are flat rooftops suitable for placing solar panels.
+
+Instructions:
+- For solar panels, look for rectangular dark-blue/black areas with a grid-like texture, often arranged in rows. They may be found on rooftops or in large open ground installations.
+- For flat rooftops suitable for solar panels, look for rooftops of buildings with flat or nearly flat geometry (not pitched/sloped). A suitable roof should be:
+  - Large enough to hold multiple solar panels.
+  - Mostly unobstructed by large structures (e.g., trees, towers, tall rooftop equipment).
+  - Having a reasonably consistent surface, where small skylights or HVAC units are acceptable.
+- Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
+- Do not classify parking lots, ground surfaces, or sloped roofs as suitable flat rooftops.
+
+Provide the output strictly in the following JSON format:
+{
+  "solar_panels": "yes/no",
+  "flat_surface": "yes/no",
+  "reasoning": "short explanation of why you answered yes or no"
+}"""
+
 
 def extract_coords_from_url(url: str):
     m = re.search(r'@([-+0-9.]+),([-+0-9.]+),\d+(?:\.\d+)?z', url)
@@ -160,7 +169,6 @@ async def fetch_static_satellite(
     zoom: int = 20,
     size_px: int = 640,
     scale: int = 2,
-    circle_radius: int | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> bytes:
     if size_px > 640:
@@ -173,9 +181,6 @@ async def fetch_static_satellite(
         "scale": str(scale),
         "key": api_key,
     }
-    if circle_radius:
-        circle_path = make_circle_path(lat, lng, radius_m=circle_radius, num_points=72)
-        params["path"] = f"fillcolor:0x7FFF0000|color:0xFF0000|weight:5|{circle_path}"
 
     close_after = False
     if client is None:
@@ -208,7 +213,6 @@ async def capture_satellite_with_browserless(
     *,
     zoom: int = 18,
     size_px: int = 500,
-    circle_radius: int | None = None,
 ) -> bytes:
     """
     Capture satellite view using browserless.io service.
@@ -235,24 +239,11 @@ async def capture_satellite_with_browserless(
     <style>
       html, body {{ height: 100%; margin: 0; padding: 0; }}
       #map {{ width: 100vw; height: 100vh; }}
-      .circle-overlay {{
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        width: {circle_radius * 2 if circle_radius else 0}px;
-        height: {circle_radius * 2 if circle_radius else 0}px;
-        border: 5px solid #FF0000;
-        border-radius: 50%;
-        background-color: rgba(255, 0, 0, 0.3);
-        pointer-events: none;
-        z-index: 1000;
-      }}
     </style>
     <script>
       let map;
       async function initMap() {{
-        const {{ Map, MapTypeId, Circle }} = await google.maps.importLibrary("maps");
+        const {{ Map, MapTypeId }} = await google.maps.importLibrary("maps");
 
         const center = {{ lat: {lat}, lng: {lng} }};
         const zoom = {zoom};
@@ -265,22 +256,6 @@ async def capture_satellite_with_browserless(
           heading: 0,
           disableDefaultUI: true,
         }});
-        
-        {f'''
-        // Add circle overlay if requested
-        if ({bool(circle_radius)}) {{
-          new Circle({{
-            strokeColor: "#FF0000",
-            strokeOpacity: 1.0,
-            strokeWeight: 5,
-            fillColor: "#FF0000",
-            fillOpacity: 0.3,
-            map,
-            center,
-            radius: {circle_radius},
-          }});
-        }}
-        ''' if circle_radius else ''}
       }}
       window.initMap = initMap;
     </script>
@@ -290,7 +265,6 @@ async def capture_satellite_with_browserless(
   </head>
   <body>
     <div id="map"></div>
-    {f'<div class="circle-overlay"></div>' if circle_radius else ''}
   </body>
 </html>"""
         
@@ -336,7 +310,6 @@ async def capture_satellite_with_playwright(
     *,
     zoom: int = 18,
     size_px: int = 500,
-    circle_radius: int | None = None,
 ) -> bytes:
     """
     Capture satellite view using Playwright browser automation.
@@ -359,24 +332,11 @@ async def capture_satellite_with_playwright(
     <style>
       html, body {{ height: 100%; margin: 0; padding: 0; }}
       #map {{ width: 100vw; height: 100vh; }}
-      .circle-overlay {{
-        position: absolute;
-        top: 50%;
-        left: 50%;
-        transform: translate(-50%, -50%);
-        width: {circle_radius * 2 if circle_radius else 0}px;
-        height: {circle_radius * 2 if circle_radius else 0}px;
-        border: 5px solid #FF0000;
-        border-radius: 50%;
-        background-color: rgba(255, 0, 0, 0.3);
-        pointer-events: none;
-        z-index: 1000;
-      }}
     </style>
     <script>
       var map;
       async function initMap() {{
-        const {{ Map, MapTypeId, Circle }} = await google.maps.importLibrary("maps");
+        const {{ Map, MapTypeId }} = await google.maps.importLibrary("maps");
 
         const center = {{ lat: {lat}, lng: {lng} }};
         const zoom = {zoom};
@@ -392,22 +352,6 @@ async def capture_satellite_with_playwright(
         
         // Set window.map for reliable detection
         window.map = map;
-        
-        {f'''
-        // Add circle overlay if requested
-        if ({bool(circle_radius)}) {{
-          new Circle({{
-            strokeColor: "#FF0000",
-            strokeOpacity: 1.0,
-            strokeWeight: 5,
-            fillColor: "#FF0000",
-            fillOpacity: 0.3,
-            map,
-            center,
-            radius: {circle_radius},
-          }});
-        }}
-        ''' if circle_radius else ''}
       }}
       window.initMap = initMap;
     </script>
@@ -417,7 +361,6 @@ async def capture_satellite_with_playwright(
   </head>
   <body>
     <div id="map"></div>
-    {f'<div class="circle-overlay"></div>' if circle_radius else ''}
   </body>
 </html>"""
 
@@ -476,7 +419,6 @@ async def satellite(
     lng: float | None = Query(default=None, description="Longitude if no URL provided"),
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=500, ge=1, le=1280),
-    circle_radius: int | None = Query(default=None, ge=1, description="Optional circle radius (meters)"),
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
 ):
@@ -507,33 +449,25 @@ async def satellite(
         use_lat, use_lng = float(lat), float(lng)
 
     # Capture satellite image using browserless
-    img_bytes = await capture_satellite_with_browserless(
-        use_lat, use_lng,
-        zoom=zoom, size_px=size_px, circle_radius=circle_radius
-    )
+    try:
+        img_bytes = await capture_satellite_with_browserless(
+            use_lat, use_lng,
+            zoom=zoom, size_px=size_px
+        )
+        
+        # Validate image bytes
+        if not img_bytes or len(img_bytes) == 0:
+            raise HTTPException(status_code=502, detail="Failed to capture satellite image: empty response")
+            
+    except Exception as e:
+        logger.error(f"Satellite image capture failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
 
     if preview:
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
-    # Send to OpenAI and return the text (reuse existing prompt)
-    prompt = ("""You are an expert in analyzing satellite images.
-Your task is to examine the provided satellite photo and determine:
-1. Whether solar panels are present.
-2. Whether there are flat rooftops suitable for placing solar panels.
-
-Instructions:
-- For solar panels, look for rectangular dark-blue/black areas with a grid-like texture, often arranged in rows. They may be found on rooftops or in large open ground installations.
-- For flat rooftops, look for rooftops of buildings with a flat geometry (not pitched/sloped).
-- Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
-
-Provide the output strictly in the following JSON format:
-{
-  "solar_panels": "yes/no",
-  "flat_surface": "yes/no",
-  "reasoning": "short explanation of why you answered yes or no"
-}""")
-    
-    text = await analyze_image_bytes_with_openai_async(img_bytes, prompt, model)
+    # Send to OpenAI and return the text
+    text = await analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
     
     # Parse the JSON response from OpenAI (reuse existing logic)
     try:
@@ -564,7 +498,6 @@ async def satellite_playwright(
     lng: float | None = Query(default=None, description="Longitude if no URL provided"),
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=1000, ge=1, le=1280),
-    circle_radius: int | None = Query(default=None, ge=1, description="Optional circle radius (meters)"),
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
 ):
@@ -595,33 +528,25 @@ async def satellite_playwright(
         use_lat, use_lng = float(lat), float(lng)
 
     # Capture satellite image using Playwright
-    img_bytes = await capture_satellite_with_playwright(
-        use_lat, use_lng,
-        zoom=zoom, size_px=size_px, circle_radius=circle_radius
-    )
+    try:
+        img_bytes = await capture_satellite_with_playwright(
+            use_lat, use_lng,
+            zoom=zoom, size_px=size_px
+        )
+        
+        # Validate image bytes
+        if not img_bytes or len(img_bytes) == 0:
+            raise HTTPException(status_code=502, detail="Failed to capture satellite image: empty response")
+            
+    except Exception as e:
+        logger.error(f"Satellite image capture failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
 
     if preview:
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
-    # Send to OpenAI and return the text (reuse existing prompt)
-    prompt = ("""You are an expert in analyzing satellite images.
-Your task is to examine the provided satellite photo and determine:
-1. Whether solar panels are present.
-2. Whether there are flat rooftops suitable for placing solar panels.
-
-Instructions:
-- For solar panels, look for rectangular dark-blue/black areas with a grid-like texture, often arranged in rows. They may be found on rooftops or in large open ground installations.
-- For flat rooftops, look for rooftops of buildings with a flat geometry (not pitched/sloped).
-- Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
-
-Provide the output strictly in the following JSON format:
-{
-  "solar_panels": "yes/no",
-  "flat_surface": "yes/no",
-  "reasoning": "short explanation of why you answered yes or no"
-}""")
-    
-    text = await analyze_image_bytes_with_openai_async(img_bytes, prompt, model)
+    # Send to OpenAI and return the text
+    text = await analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
     
     # Parse the JSON response from OpenAI (reuse existing logic)
     try:
