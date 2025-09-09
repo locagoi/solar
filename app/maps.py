@@ -114,9 +114,9 @@ Instructions:
 
 Provide the output strictly in the following JSON format:
 {
-  "solar_panels": "yes/no",
-  "flat_surface": "yes/no",
-  "reasoning": "short explanation of why you answered yes or no"
+  "solar_panels": true/false,
+  "flat_surface": true/false,
+  "reasoning": "short explanation of why you answered true or false"
 }"""
 
 
