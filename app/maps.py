@@ -11,13 +11,16 @@ import gc
 from io import BytesIO
 from urllib.parse import urlparse, parse_qs, unquote
 from fastapi.responses import StreamingResponse
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends, Header
 
 # ---------- OpenAI ----------
 from openai import OpenAI, AsyncOpenAI
 
 # ---------- Playwright ----------
 from playwright.async_api import async_playwright
+
+# ---------- Supabase ----------
+from supabase import create_client, Client
 
 # Global browser instance - only one browser and one page for all requests
 _playwright = None
@@ -29,6 +32,79 @@ _browser_lock = asyncio.Lock()
 playwright_semaphore = asyncio.Semaphore(1)  # Max 1 concurrent request
 
 logger = logging.getLogger(__name__)
+
+# ---------- Authentication ----------
+async def verify_bearer_token(authorization: str = Header(None)):
+    """Verify bearer token from Authorization header."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+    
+    token = authorization[7:]  # Remove "Bearer " prefix
+    
+    expected_token = os.getenv("BEARER_TOKEN")
+    if not expected_token:
+        raise HTTPException(status_code=500, detail="BEARER_TOKEN is not configured")
+    
+    if token != expected_token:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    
+    return token
+
+# ---------- Supabase Storage ----------
+def get_supabase_client() -> Client:
+    """Get Supabase client instance."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_ANON_KEY")
+    
+    if not supabase_url:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL is not configured")
+    if not supabase_key:
+        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY is not configured")
+    
+    return create_client(supabase_url, supabase_key)
+
+async def upload_image_to_supabase(
+    image_bytes: bytes,
+    filename: str,
+    bucket_name: str = "satellite-images"
+) -> str:
+    """
+    Upload image bytes to Supabase storage and return the public URL.
+    
+    Args:
+        image_bytes: The image data as bytes
+        filename: Name for the uploaded file
+        bucket_name: Supabase storage bucket name
+        
+    Returns:
+        Public URL of the uploaded image
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Upload the image to Supabase storage
+        response = supabase.storage.from_(bucket_name).upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": "image/png"}
+        )
+        
+        if response.get("error"):
+            logger.error(f"Supabase upload error: {response['error']}")
+            raise HTTPException(status_code=502, detail=f"Supabase upload failed: {response['error']}")
+        
+        # Get the public URL
+        public_url = supabase.storage.from_(bucket_name).get_public_url(filename)
+        
+        logger.info(f"Image uploaded to Supabase: {public_url}")
+        return public_url
+        
+    except Exception as e:
+        logger.exception(f"Supabase upload failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to upload image to Supabase: {str(e)}")
 
 def _log_memory(step: str):
     """Log current memory usage for debugging."""
@@ -206,102 +282,6 @@ async def fetch_static_satellite(
         if close_after:
             await client.aclose()
 
-# ---------- Browserless.io satellite capture ----------
-async def capture_satellite_with_browserless(
-    lat: float,
-    lng: float,
-    *,
-    zoom: int = 18,
-    size_px: int = 500,
-) -> bytes:
-    """
-    Capture satellite view using browserless.io service.
-    This provides more flexibility than the Static Maps API without local browser dependencies.
-    """
-    try:
-        # Get API keys from environment
-        browserless_api_key = os.getenv("BROWSERLESS_API_KEY")
-        google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-        
-        if not browserless_api_key:
-            raise HTTPException(status_code=500, detail="BROWSERLESS_API_KEY is not configured")
-        if not google_maps_api_key:
-            raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
-        
-        browserless_url = f"https://production-sfo.browserless.io/chrome/screenshot?token={browserless_api_key}"
-        
-        # Create HTML content with the specified coordinates
-        html_content = f"""<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Satellite Map</title>
-    <style>
-      html, body {{ height: 100%; margin: 0; padding: 0; }}
-      #map {{ width: 100vw; height: 100vh; }}
-    </style>
-    <script>
-      let map;
-      async function initMap() {{
-        const {{ Map, MapTypeId }} = await google.maps.importLibrary("maps");
-
-        const center = {{ lat: {lat}, lng: {lng} }};
-        const zoom = {zoom};
-
-        map = new Map(document.getElementById("map"), {{
-          center,
-          zoom,
-          mapTypeId: MapTypeId.SATELLITE,
-          tilt: 0,
-          heading: 0,
-          disableDefaultUI: true,
-        }});
-      }}
-      window.initMap = initMap;
-    </script>
-    <script async
-      src="https://maps.googleapis.com/maps/api/js?key={google_maps_api_key}&callback=initMap&v=weekly">
-    </script>
-  </head>
-  <body>
-    <div id="map"></div>
-  </body>
-</html>"""
-        
-        payload = {
-            "html": html_content,
-            "waitForTimeout": 3000,  # Wait 3 seconds for map to load
-            "options": {
-                "type": "png",
-                "fullPage": False
-            },
-            "viewport": {
-                "width": size_px,
-                "height": size_px,
-                "deviceScaleFactor": 2  # Higher resolution
-            }
-        }
-        
-        # Make request to browserless.io
-        async with httpx.AsyncClient() as client:
-            response = await client.post(browserless_url, json=payload, timeout=60.0)
-            response.raise_for_status()
-            
-            if response.headers.get("Content-Type", "").startswith("image/"):
-                return response.content
-            else:
-                logger.error("Browserless returned non-image content: %s", response.text)
-                raise HTTPException(status_code=502, detail="Browserless returned non-image content")
-                
-    except httpx.HTTPStatusError as e:
-        logger.error("Browserless HTTP error: status=%s body=%s", e.response.status_code, e.response.text)
-        raise HTTPException(status_code=502, detail=f"Browserless HTTP error: {e}")
-    except httpx.RequestError as e:
-        logger.error("Browserless request error: %s", e)
-        raise HTTPException(status_code=502, detail=f"Browserless request error: {e}")
-    except Exception as e:
-        logger.exception("Browserless capture failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"Browserless capture error: {e}")
 
 # ---------- Playwright satellite capture ----------
 async def capture_satellite_with_playwright(
@@ -411,88 +391,9 @@ async def capture_satellite_with_playwright(
             except:  # noqa
                 pass
 
-# ---------- Single endpoint: build image -> send to OpenAI -> return text ----------
-@router.get("/satellite", summary="Capture satellite image using browserless.io service")
+
+@router.get("/satellite", summary="Capture satellite image using Playwright browser automation")
 async def satellite(
-    url: str | None = Query(default=None, description="Google Maps URL (supports @lat,lng, place_id, or q=...)"),
-    lat: float | None = Query(default=None, description="Latitude if no URL provided"),
-    lng: float | None = Query(default=None, description="Longitude if no URL provided"),
-    zoom: int = Query(default=18, ge=0, le=21),
-    size_px: int = Query(default=500, ge=1, le=1280),
-    preview: bool = False,
-    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
-):
-    """
-    Capture satellite view using browserless.io service.
-    This provides more flexibility than the Static Maps API without local browser dependencies.
-    """
-    # figure out coordinates (reuse existing logic)
-    if url:
-        try:
-            parsed = extract_coords_from_url(url)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        if isinstance(parsed, tuple) and len(parsed) == 2 and isinstance(parsed[0], float):
-            use_lat, use_lng = parsed
-        elif isinstance(parsed, tuple) and parsed[0] == "place_id":
-            # For place_id, we still need Google Maps API key
-            gkey = os.getenv("GOOGLE_MAPS_API_KEY")
-            if not gkey:
-                raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is required for place_id resolution")
-            async with httpx.AsyncClient() as c:
-                use_lat, use_lng = await resolve_place_id_to_coords(parsed[1], gkey, c)
-        else:
-            raise HTTPException(status_code=400, detail="Unrecognized URL format.")
-    else:
-        if lat is None or lng is None:
-            raise HTTPException(status_code=400, detail="Provide either 'url' or both 'lat' and 'lng'.")
-        use_lat, use_lng = float(lat), float(lng)
-
-    # Capture satellite image using browserless
-    try:
-        img_bytes = await capture_satellite_with_browserless(
-            use_lat, use_lng,
-            zoom=zoom, size_px=size_px
-        )
-        
-        # Validate image bytes
-        if not img_bytes or len(img_bytes) == 0:
-            raise HTTPException(status_code=502, detail="Failed to capture satellite image: empty response")
-            
-    except Exception as e:
-        logger.error(f"Satellite image capture failed: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
-
-    if preview:
-        return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
-
-    # Send to OpenAI and return the text
-    text = await analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
-    
-    # Parse the JSON response from OpenAI (reuse existing logic)
-    try:
-        if isinstance(text, str):
-            try:
-                parsed = json.loads(text)
-                if "result" in parsed:
-                    result_data = json.loads(parsed["result"])
-                else:
-                    result_data = parsed
-            except json.JSONDecodeError:
-                json_match = re.search(r'\{.*\}', text, re.DOTALL)
-                if json_match:
-                    result_data = json.loads(json_match.group())
-                else:
-                    result_data = {"raw_response": text}
-        else:
-            result_data = text
-            
-        return {"model": model, "result": result_data}
-    except Exception as e:
-        return {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
-
-@router.get("/satellite-playwright", summary="Capture satellite image using Playwright browser automation")
-async def satellite_playwright(
     url: str | None = Query(default=None, description="Google Maps URL (supports @lat,lng, place_id, or q=...)"),
     lat: float | None = Query(default=None, description="Latitude if no URL provided"),
     lng: float | None = Query(default=None, description="Longitude if no URL provided"),
@@ -500,6 +401,7 @@ async def satellite_playwright(
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    token: str = Depends(verify_bearer_token),
 ):
     """
     Capture satellite view using Playwright browser automation.
