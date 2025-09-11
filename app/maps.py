@@ -85,11 +85,18 @@ async def upload_image_to_supabase(
     try:
         supabase = get_supabase_client()
         
-        # Upload the image to Supabase storage with upsert to force overwrite
+        # Check if file exists and delete it first to ensure overwrite
+        try:
+            supabase.storage.from_(bucket_name).remove([filename])
+        except Exception:
+            # File doesn't exist, which is fine - we'll create it
+            pass
+        
+        # Upload the image to Supabase storage
         response = supabase.storage.from_(bucket_name).upload(
             path=filename,
             file=image_bytes,
-            file_options={"content-type": "image/png", "upsert": True}
+            file_options={"content-type": "image/png"}
         )
         
         # Check if upload was successful
