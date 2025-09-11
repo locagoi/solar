@@ -85,11 +85,11 @@ async def upload_image_to_supabase(
     try:
         supabase = get_supabase_client()
         
-        # Upload the image to Supabase storage
+        # Upload the image to Supabase storage with upsert to force overwrite
         response = supabase.storage.from_(bucket_name).upload(
             path=filename,
             file=image_bytes,
-            file_options={"content-type": "image/png"}
+            file_options={"content-type": "image/png", "upsert": True}
         )
         
         # Check if upload was successful
@@ -111,7 +111,8 @@ async def save_analysis_to_meta(
     photo_name: str,
     solar_panels: bool,
     flat_surface: bool,
-    reasoning: str
+    reasoning: str,
+    place_id: str
 ) -> dict:
     """
     Save satellite analysis results to the meta table.
@@ -122,6 +123,7 @@ async def save_analysis_to_meta(
         solar_panels: Whether solar panels are present
         flat_surface: Whether flat surface is suitable
         reasoning: Explanation of the analysis
+        place_id: Google Place ID (required)
         
     Returns:
         Dictionary with the saved/updated record data
@@ -135,6 +137,7 @@ async def save_analysis_to_meta(
             "solar_panels": solar_panels,
             "flat_surface": flat_surface,
             "reasoning": reasoning,
+            "place_id": place_id,
             "updated_at": "now()"
         }
         
@@ -154,6 +157,65 @@ async def save_analysis_to_meta(
     except Exception as e:
         logger.exception(f"Meta table upsert failed: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to save analysis to meta table: {str(e)}")
+
+async def save_leads_data(
+    company_name: str = None,
+    website: str = None,
+    phone: str = None,
+    address: str = None,
+    country: str = None,
+    person_first_name: str = None,
+    person_last_name: str = None,
+    person_phone: str = None,
+    person_email: str = None,
+    google_maps_url: str = None,
+    place_id: str = None
+) -> dict:
+    """
+    Save company and person leads data to the leads table.
+    Updates existing record if place_id exists, otherwise creates new record.
+    
+    Returns:
+        Dictionary with the saved/updated record data
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Prepare the data for upsert
+        data = {
+            "company_name": company_name,
+            "website": website,
+            "phone": phone,
+            "address": address,
+            "country": country,
+            "person_first_name": person_first_name,
+            "person_last_name": person_last_name,
+            "person_phone": person_phone,
+            "person_email": person_email,
+            "google_maps_url": google_maps_url,
+            "place_id": place_id,
+            "updated_at": "now()"
+        }
+        
+        # Remove None values to avoid storing empty strings
+        data = {k: v for k, v in data.items() if v is not None}
+        
+        # Use upsert to update if exists, insert if not
+        # This will update the record if place_id already exists
+        response = supabase.table("leads").upsert(
+            data, 
+            on_conflict="place_id"
+        ).execute()
+        
+        if hasattr(response, 'data') and response.data:
+            return response.data[0]
+        else:
+            logger.error(f"Failed to upsert to leads table: {response}")
+            raise HTTPException(status_code=502, detail="Failed to save leads data")
+            
+    except Exception as e:
+        logger.exception(f"Leads table upsert failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to save leads data: {str(e)}")
 
 def _log_memory(step: str):
     """Log current memory usage for debugging."""
@@ -553,7 +615,8 @@ async def satellite(
                     photo_name=filename,
                     solar_panels=solar_panels,
                     flat_surface=flat_surface,
-                    reasoning=result_data["reasoning"]
+                    reasoning=result_data["reasoning"],
+                    place_id=place_id
                 )
             except Exception as e:
                 logger.error(f"Failed to save to meta table: {e}")
@@ -570,4 +633,61 @@ async def satellite(
         if supabase_url:
             response_data["supabase_url"] = supabase_url
         return response_data
+
+@router.post("/leads", summary="Save company and person leads data")
+async def save_leads(
+    company_name: str = Query(default=None, description="Company name"),
+    website: str = Query(default=None, description="Company website"),
+    phone: str = Query(default=None, description="Company phone number"),
+    address: str = Query(default=None, description="Company address"),
+    country: str = Query(default=None, description="Country"),
+    person_first_name: str = Query(default=None, description="Contact person first name"),
+    person_last_name: str = Query(default=None, description="Contact person last name"),
+    person_phone: str = Query(default=None, description="Contact person phone"),
+    person_email: str = Query(default=None, description="Contact person email"),
+    google_maps_url: str = Query(description="Google Maps URL (required for place_id extraction)"),
+    token: str = Depends(verify_bearer_token),
+):
+    """
+    Save company and person leads data to the leads table.
+    Updates existing record if place_id exists, otherwise creates new record.
+    """
+    try:
+        # Extract place_id from google_maps_url
+        if not google_maps_url:
+            raise HTTPException(status_code=400, detail="google_maps_url is required")
+        
+        try:
+            parsed = extract_coords_from_url(google_maps_url)
+            if isinstance(parsed, tuple) and parsed[0] == "place_id":
+                place_id = parsed[1]
+            else:
+                raise HTTPException(status_code=400, detail="Could not extract place_id from Google Maps URL")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid Google Maps URL: {str(e)}")
+        
+        leads_record = await save_leads_data(
+            company_name=company_name,
+            website=website,
+            phone=phone,
+            address=address,
+            country=country,
+            person_first_name=person_first_name,
+            person_last_name=person_last_name,
+            person_phone=person_phone,
+            person_email=person_email,
+            google_maps_url=google_maps_url,
+            place_id=place_id
+        )
+        
+        return {
+            "success": True,
+            "message": "Leads data saved successfully",
+            "leads_id": leads_record["id"],
+            "data": leads_record
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to save leads data: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save leads data: {str(e)}")
 
