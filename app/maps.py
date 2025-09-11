@@ -55,21 +55,21 @@ async def verify_bearer_token(authorization: str = Header(None)):
 
 # ---------- Supabase Storage ----------
 def get_supabase_client() -> Client:
-    """Get Supabase client instance."""
+    """Get Supabase client instance with service key (bypasses RLS)."""
     supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_ANON_KEY")
+    supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
     
     if not supabase_url:
         raise HTTPException(status_code=500, detail="SUPABASE_URL is not configured")
-    if not supabase_key:
-        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY is not configured")
+    if not supabase_service_key:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY is not configured")
     
-    return create_client(supabase_url, supabase_key)
+    return create_client(supabase_url, supabase_service_key)
 
 async def upload_image_to_supabase(
     image_bytes: bytes,
     filename: str,
-    bucket_name: str = "satellite-images"
+    bucket_name: str = "photos"
 ) -> str:
     """
     Upload image bytes to Supabase storage and return the public URL.
@@ -92,9 +92,10 @@ async def upload_image_to_supabase(
             file_options={"content-type": "image/png"}
         )
         
-        if response.get("error"):
-            logger.error(f"Supabase upload error: {response['error']}")
-            raise HTTPException(status_code=502, detail=f"Supabase upload failed: {response['error']}")
+        # Check if upload was successful
+        if hasattr(response, 'status_code') and response.status_code >= 400:
+            logger.error(f"Supabase upload failed with status: {response.status_code}")
+            raise HTTPException(status_code=502, detail=f"Supabase upload failed with status: {response.status_code}")
         
         # Get the public URL
         public_url = supabase.storage.from_(bucket_name).get_public_url(filename)
@@ -105,6 +106,54 @@ async def upload_image_to_supabase(
     except Exception as e:
         logger.exception(f"Supabase upload failed: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to upload image to Supabase: {str(e)}")
+
+async def save_analysis_to_meta(
+    photo_name: str,
+    solar_panels: bool,
+    flat_surface: bool,
+    reasoning: str
+) -> dict:
+    """
+    Save satellite analysis results to the meta table.
+    Updates existing record if photo_name exists, otherwise creates new record.
+    
+    Args:
+        photo_name: Name of the photo file
+        solar_panels: Whether solar panels are present
+        flat_surface: Whether flat surface is suitable
+        reasoning: Explanation of the analysis
+        
+    Returns:
+        Dictionary with the saved/updated record data
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Prepare the data for upsert
+        data = {
+            "photo_name": photo_name,
+            "solar_panels": solar_panels,
+            "flat_surface": flat_surface,
+            "reasoning": reasoning,
+            "updated_at": "now()"
+        }
+        
+        # Use upsert to update if exists, insert if not
+        # This will update the record if photo_name already exists
+        response = supabase.table("meta").upsert(
+            data, 
+            on_conflict="photo_name"
+        ).execute()
+        
+        if hasattr(response, 'data') and response.data:
+            return response.data[0]
+        else:
+            logger.error(f"Failed to upsert to meta table: {response}")
+            raise HTTPException(status_code=502, detail="Failed to save analysis to meta table")
+            
+    except Exception as e:
+        logger.exception(f"Meta table upsert failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to save analysis to meta table: {str(e)}")
 
 def _log_memory(step: str):
     """Log current memory usage for debugging."""
@@ -408,6 +457,7 @@ async def satellite(
     This provides local browser control without external service dependencies.
     """
     # figure out coordinates (reuse existing logic)
+    place_id = None
     if url:
         try:
             parsed = extract_coords_from_url(url)
@@ -417,6 +467,7 @@ async def satellite(
             use_lat, use_lng = parsed
         elif isinstance(parsed, tuple) and parsed[0] == "place_id":
             # For place_id, we still need Google Maps API key
+            place_id = parsed[1]  # Store the place_id for filename
             gkey = os.getenv("GOOGLE_MAPS_API_KEY")
             if not gkey:
                 raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is required for place_id resolution")
@@ -444,6 +495,23 @@ async def satellite(
         logger.error(f"Satellite image capture failed: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
 
+    # Always upload to Supabase
+    supabase_url = None
+    try:
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Use place_id as filename if available, otherwise use coordinates
+        if place_id:
+            filename = f"{place_id}.png"
+        else:
+            filename = f"satellite_{use_lat:.6f}_{use_lng:.6f}.png"
+            
+        supabase_url = await upload_image_to_supabase(img_bytes, filename)
+    except Exception as e:
+        logger.error(f"Supabase upload failed: {e}")
+        # Don't fail the entire request if upload fails, just log the error
+
     if preview:
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
@@ -468,7 +536,38 @@ async def satellite(
         else:
             result_data = text
             
-        return {"model": model, "result": result_data}
+        # Save analysis results to meta table if we have valid data
+        meta_record = None
+        if isinstance(result_data, dict) and all(key in result_data for key in ["solar_panels", "flat_surface", "reasoning"]):
+            try:
+                # Convert string values to boolean if needed
+                solar_panels = result_data["solar_panels"]
+                flat_surface = result_data["flat_surface"]
+                
+                if isinstance(solar_panels, str):
+                    solar_panels = solar_panels.lower() in ["true", "yes"]
+                if isinstance(flat_surface, str):
+                    flat_surface = flat_surface.lower() in ["true", "yes"]
+                
+                meta_record = await save_analysis_to_meta(
+                    photo_name=filename,
+                    solar_panels=solar_panels,
+                    flat_surface=flat_surface,
+                    reasoning=result_data["reasoning"]
+                )
+            except Exception as e:
+                logger.error(f"Failed to save to meta table: {e}")
+                # Don't fail the entire request if meta save fails
+        
+        response_data = {"model": model, "result": result_data}
+        if supabase_url:
+            response_data["supabase_url"] = supabase_url
+        if meta_record:
+            response_data["meta_id"] = meta_record["id"]
+        return response_data
     except Exception as e:
-        return {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
+        response_data = {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
+        if supabase_url:
+            response_data["supabase_url"] = supabase_url
+        return response_data
 
