@@ -287,6 +287,31 @@ async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str,
         logger.exception("OpenAI async request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
+async def analyze_suitability_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> str:
+    """
+    Async variant for suitability analysis that avoids blocking the event loop during OpenAI network I/O.
+    """
+    data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
+    try:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
+        client = AsyncOpenAI(api_key=api_key)
+        resp = await client.responses.create(
+            model=model,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": data_url},
+                ],
+            }],
+        )
+        return getattr(resp, "output_text", None) or str(resp)
+    except Exception as e:
+        logger.exception("OpenAI suitability analysis request failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"OpenAI suitability analysis error: {e}")
+
 # ---------- Google Maps ----------
 router = APIRouter(prefix="/maps", tags=["maps"])
 GOOGLE_BASE = "https://maps.googleapis.com/maps/api"
@@ -313,6 +338,59 @@ Provide the output strictly in the following JSON format:
   "reasoning": "short explanation of why you answered true or false"
 }"""
 
+# OpenAI prompt for solar panel suitability analysis
+SUITABILITY_ANALYSIS_PROMPT = """You are an expert in analyzing solar panel suitability for rooftops.
+Your task is to examine the provided satellite photo and determine the solar panel suitability of the property located in the center of the image.
+
+Analyze the roof(s) of the central property according to the following scoring system:
+
+Scoring form (image-based only, 0–100 points):
+
+Usable Roof Area (0–30)
+- 1000 m² → 30
+- 500–1000 m² → 24
+- 200–499 m² → 16
+- 100–199 m² → 8
+- <100 m² → 0 (Reject)
+
+Shading (0–30)
+- No visible obstacles South/East/West → 30
+- Few small obstacles, distance >1.5× their height → 22
+- Several obstacles, distance ≈1× height → 14
+- Dense trees/buildings close to roof → 6
+- Heavy shading → 0 (Reject)
+
+Obstructions & Shape (0–20)
+- <5% of roof blocked (skylights, HVAC, chimneys) → 20
+- 5–10% → 15
+- 10–20% → 10
+- 20% → 0 (Reject)
+
+Orientation & Slope (0–10)
+- South-facing, 10–35° tilt → 10
+- Flat roof (can be tilted) → 8
+- East/West → 7
+- North/steep tilt → 3
+
+Accessibility (0–10)    
+- Good access/clear crane position visible → 10
+- Limited access → 5
+- Very restricted/no access → 0
+
+Total Score = Sum (max. 100)
+
+Classification:
+A-Roof: ≥75 points → very attractive
+B-Roof: 60–74 → good
+C-Roof: 45–59 → borderline
+Reject: <45 or KO
+
+Output format:
+Return the result strictly in the following JSON format (no extra text):
+{
+  "score": 0-100,
+  "reasoning": "Detailed explanation of how you scored each category and why"
+}"""
 
 def extract_coords_from_url(url: str):
     m = re.search(r'@([-+0-9.]+),([-+0-9.]+),\d+(?:\.\d+)?z', url)
@@ -519,6 +597,7 @@ async def satellite(
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    suitability: bool = Query(default=False, description="Analyze solar panel suitability"),
     token: str = Depends(verify_bearer_token),
 ):
     """
@@ -605,6 +684,30 @@ async def satellite(
         else:
             result_data = text
             
+        # Perform suitability analysis if requested
+        suitability_data = None
+        if suitability:
+            try:
+                suitability_text = await analyze_suitability_with_openai_async(img_bytes, SUITABILITY_ANALYSIS_PROMPT, model)
+                if isinstance(suitability_text, str):
+                    try:
+                        suitability_parsed = json.loads(suitability_text)
+                        if "result" in suitability_parsed:
+                            suitability_data = json.loads(suitability_parsed["result"])
+                        else:
+                            suitability_data = suitability_parsed
+                    except json.JSONDecodeError:
+                        suitability_json_match = re.search(r'\{.*\}', suitability_text, re.DOTALL)
+                        if suitability_json_match:
+                            suitability_data = json.loads(suitability_json_match.group())
+                        else:
+                            suitability_data = {"raw_response": suitability_text}
+                else:
+                    suitability_data = suitability_text
+            except Exception as e:
+                logger.error(f"Suitability analysis failed: {e}")
+                suitability_data = {"error": str(e)}
+            
         # Save analysis results to meta table if we have valid data
         meta_record = None
         if isinstance(result_data, dict) and all(key in result_data for key in ["solar_panels", "flat_surface", "reasoning"]):
@@ -634,6 +737,8 @@ async def satellite(
             response_data["supabase_url"] = supabase_url
         if meta_record:
             response_data["meta_id"] = meta_record["id"]
+        if suitability_data:
+            response_data["suitability"] = suitability_data
         return response_data
     except Exception as e:
         response_data = {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
