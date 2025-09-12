@@ -119,7 +119,9 @@ async def save_analysis_to_meta(
     solar_panels: bool,
     flat_surface: bool,
     reasoning: str,
-    place_id: str
+    place_id: str,
+    suitability_score: int = None,
+    suitability_reasoning: str = None
 ) -> dict:
     """
     Save satellite analysis results to the meta table.
@@ -131,6 +133,8 @@ async def save_analysis_to_meta(
         flat_surface: Whether flat surface is suitable
         reasoning: Explanation of the analysis
         place_id: Google Place ID (required)
+        suitability_score: Solar panel suitability score (0-100)
+        suitability_reasoning: Detailed suitability analysis reasoning
         
     Returns:
         Dictionary with the saved/updated record data
@@ -147,6 +151,12 @@ async def save_analysis_to_meta(
             "place_id": place_id,
             "updated_at": "now()"
         }
+        
+        # Add suitability data if provided
+        if suitability_score is not None:
+            data["suitability_score"] = suitability_score
+        if suitability_reasoning is not None:
+            data["suitability_reasoning"] = suitability_reasoning
         
         # Use upsert to update if exists, insert if not
         # This will update the record if photo_name already exists
@@ -721,12 +731,26 @@ async def satellite(
                 if isinstance(flat_surface, str):
                     flat_surface = flat_surface.lower() in ["true", "yes"]
                 
+                # Extract suitability data if available
+                suitability_score = None
+                suitability_reasoning = None
+                if suitability_data and isinstance(suitability_data, dict):
+                    if "score" in suitability_data:
+                        try:
+                            suitability_score = int(suitability_data["score"])
+                        except (ValueError, TypeError):
+                            logger.warning(f"Could not convert suitability score to int: {suitability_data.get('score')}")
+                    if "reasoning" in suitability_data:
+                        suitability_reasoning = suitability_data["reasoning"]
+                
                 meta_record = await save_analysis_to_meta(
                     photo_name=filename,
                     solar_panels=solar_panels,
                     flat_surface=flat_surface,
                     reasoning=result_data["reasoning"],
-                    place_id=place_id
+                    place_id=place_id,
+                    suitability_score=suitability_score,
+                    suitability_reasoning=suitability_reasoning
                 )
             except Exception as e:
                 logger.error(f"Failed to save to meta table: {e}")
