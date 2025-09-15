@@ -272,9 +272,10 @@ def _get_openai_client() -> OpenAI:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
     return OpenAI(api_key=api_key)
 
-async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> str:
+async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> tuple[str, dict]:
     """
     Async variant that avoids blocking the event loop during OpenAI network I/O.
+    Returns tuple of (response_text, usage_info)
     """
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
     try:
@@ -292,14 +293,37 @@ async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str,
                 ],
             }],
         )
-        return getattr(resp, "output_text", None) or str(resp)
+        
+        # Extract usage information
+        usage_info = {}
+        if hasattr(resp, 'usage'):
+            # Try different possible attribute names
+            usage_info = {
+                "prompt_tokens": getattr(resp.usage, 'prompt_tokens', getattr(resp.usage, 'input_tokens', 0)),
+                "completion_tokens": getattr(resp.usage, 'completion_tokens', getattr(resp.usage, 'output_tokens', 0)),
+                "total_tokens": getattr(resp.usage, 'total_tokens', 0)
+            }
+            
+            # If we still have 0s, try to access as dictionary
+            if usage_info["prompt_tokens"] == 0 and usage_info["completion_tokens"] == 0:
+                if hasattr(resp.usage, '__dict__'):
+                    usage_dict = resp.usage.__dict__
+                    usage_info = {
+                        "prompt_tokens": usage_dict.get('prompt_tokens', usage_dict.get('input_tokens', 0)),
+                        "completion_tokens": usage_dict.get('completion_tokens', usage_dict.get('output_tokens', 0)),
+                        "total_tokens": usage_dict.get('total_tokens', 0)
+                    }
+        
+        response_text = getattr(resp, "output_text", None) or str(resp)
+        return response_text, usage_info
     except Exception as e:
         logger.exception("OpenAI async request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
 
-async def analyze_suitability_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> str:
+async def analyze_suitability_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> tuple[str, dict]:
     """
     Async variant for suitability analysis that avoids blocking the event loop during OpenAI network I/O.
+    Returns tuple of (response_text, usage_info)
     """
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
     try:
@@ -317,7 +341,29 @@ async def analyze_suitability_with_openai_async(image_bytes: bytes, prompt: str,
                 ],
             }],
         )
-        return getattr(resp, "output_text", None) or str(resp)
+        
+        # Extract usage information
+        usage_info = {}
+        if hasattr(resp, 'usage'):
+            # Try different possible attribute names
+            usage_info = {
+                "prompt_tokens": getattr(resp.usage, 'prompt_tokens', getattr(resp.usage, 'input_tokens', 0)),
+                "completion_tokens": getattr(resp.usage, 'completion_tokens', getattr(resp.usage, 'output_tokens', 0)),
+                "total_tokens": getattr(resp.usage, 'total_tokens', 0)
+            }
+            
+            # If we still have 0s, try to access as dictionary
+            if usage_info["prompt_tokens"] == 0 and usage_info["completion_tokens"] == 0:
+                if hasattr(resp.usage, '__dict__'):
+                    usage_dict = resp.usage.__dict__
+                    usage_info = {
+                        "prompt_tokens": usage_dict.get('prompt_tokens', usage_dict.get('input_tokens', 0)),
+                        "completion_tokens": usage_dict.get('completion_tokens', usage_dict.get('output_tokens', 0)),
+                        "total_tokens": usage_dict.get('total_tokens', 0)
+                    }
+        
+        response_text = getattr(resp, "output_text", None) or str(resp)
+        return response_text, usage_info
     except Exception as e:
         logger.exception("OpenAI suitability analysis request failed: %s", e)
         raise HTTPException(status_code=502, detail=f"OpenAI suitability analysis error: {e}")
@@ -674,7 +720,14 @@ async def satellite(
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
     # Send to OpenAI and return the text
-    text = await analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
+    text, main_usage = await analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
+    
+    # Initialize total token usage
+    total_usage = {
+        "prompt_tokens": main_usage.get("prompt_tokens", 0),
+        "completion_tokens": main_usage.get("completion_tokens", 0),
+        "total_tokens": main_usage.get("total_tokens", 0)
+    }
     
     # Parse the JSON response from OpenAI (reuse existing logic)
     try:
@@ -698,7 +751,13 @@ async def satellite(
         suitability_data = None
         if suitability:
             try:
-                suitability_text = await analyze_suitability_with_openai_async(img_bytes, SUITABILITY_ANALYSIS_PROMPT, model)
+                suitability_text, suitability_usage = await analyze_suitability_with_openai_async(img_bytes, SUITABILITY_ANALYSIS_PROMPT, model)
+                
+                # Add suitability usage to total
+                total_usage["prompt_tokens"] += suitability_usage.get("prompt_tokens", 0)
+                total_usage["completion_tokens"] += suitability_usage.get("completion_tokens", 0)
+                total_usage["total_tokens"] += suitability_usage.get("total_tokens", 0)
+                
                 if isinstance(suitability_text, str):
                     try:
                         suitability_parsed = json.loads(suitability_text)
@@ -756,7 +815,15 @@ async def satellite(
                 logger.error(f"Failed to save to meta table: {e}")
                 # Don't fail the entire request if meta save fails
         
-        response_data = {"model": model, "result": result_data}
+        response_data = {
+            "model": model, 
+            "result": result_data,
+            "coordinates": {
+                "lat": use_lat,
+                "lng": use_lng
+            },
+            "token_usage": total_usage
+        }
         if supabase_url:
             response_data["supabase_url"] = supabase_url
         if meta_record:
@@ -765,7 +832,15 @@ async def satellite(
             response_data["suitability"] = suitability_data
         return response_data
     except Exception as e:
-        response_data = {"model": model, "result": {"raw_response": text, "parse_error": str(e)}}
+        response_data = {
+            "model": model, 
+            "result": {"raw_response": text, "parse_error": str(e)},
+            "coordinates": {
+                "lat": use_lat,
+                "lng": use_lng
+            },
+            "token_usage": total_usage if 'total_usage' in locals() else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
         if supabase_url:
             response_data["supabase_url"] = supabase_url
         return response_data
