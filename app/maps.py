@@ -615,14 +615,24 @@ async def capture_satellite_with_playwright(
         try:
             await page.set_content(html_content, wait_until="domcontentloaded", timeout=15000)
 
-            # FIX: Wait for tiles using DOM-based signal
+            # Wait for Google Maps to initialize
             await page.wait_for_function(
                 "() => document.querySelector('#map') && "
                 "document.querySelector('#map').children.length > 0",
                 timeout=10000
             )
             
-            await page.wait_for_timeout(1500)  # small extra settle
+            # Wait for map tiles to load (increased from 1500ms for better rendering)
+            # Google Maps satellite tiles can take 2-4 seconds to fully load
+            await page.wait_for_timeout(3000)
+            
+            # Additional check: wait for network to be mostly idle
+            try:
+                await page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                # If networkidle times out, continue anyway (tiles might still be loading)
+                logger.warning("Network idle timeout - proceeding with screenshot anyway")
+                pass
 
             # Take screenshot
             screenshot_bytes = await page.screenshot(
