@@ -64,6 +64,18 @@ EXPOSE 8000
 # Healthcheck (hit /health)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
-# Run uvicorn directly with access log enabled; control app log level via LOG_LEVEL env
+# Run with Gunicorn + Uvicorn workers for automatic memory management
+# --max-requests 100: Restart worker after 100 requests to free accumulated memory
+# --max-requests-jitter 20: Add randomness (80-120 requests) to prevent simultaneous restarts
+# --timeout 120: Allow 2 minutes for long-running Playwright/OpenAI operations
+# --workers 1: Single worker for memory-constrained environments (increase for more RAM)
 ENV LOG_LEVEL=INFO
-CMD ["/venv/bin/uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--access-log"]
+CMD ["/venv/bin/gunicorn", "app.main:app", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "1", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--max-requests", "100", \
+     "--max-requests-jitter", "20", \
+     "--timeout", "120", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]
