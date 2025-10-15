@@ -22,14 +22,17 @@ from playwright.async_api import async_playwright
 # ---------- Supabase ----------
 from supabase import create_client, Client
 
-# Global browser instance - only one browser and one page for all requests
+# Global browser instance - shared across all requests
+# Each request gets its own isolated browser context for parallel screenshot capture
 _playwright = None
 _browser = None
 _page = None
 _browser_lock = asyncio.Lock()
 
-# Ultra-strict concurrency limit for 512MB RAM - only 1 request at a time
-playwright_semaphore = asyncio.Semaphore(1)  # Max 1 concurrent request
+# Concurrency limit for Playwright screenshot operations
+# Set to match number of Gunicorn workers for optimal throughput
+# Each concurrent screenshot uses ~50-80MB additional RAM
+playwright_semaphore = asyncio.Semaphore(2)  # Max 2 concurrent screenshots
 
 logger = logging.getLogger(__name__)
 

@@ -68,11 +68,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s CMD curl -fsS http://
 # --max-requests 100: Restart worker after 100 requests to free accumulated memory
 # --max-requests-jitter 20: Add randomness (80-120 requests) to prevent simultaneous restarts
 # --timeout 120: Allow 2 minutes for long-running Playwright/OpenAI operations
-# --workers 1: Single worker for memory-constrained environments (increase for more RAM)
+# --workers 2: Two workers for better throughput (requires ~1GB+ RAM)
 ENV LOG_LEVEL=INFO
 CMD ["/venv/bin/gunicorn", "app.main:app", \
      "--bind", "0.0.0.0:8000", \
-     "--workers", "1", \
+     "--workers", "2", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--max-requests", "100", \
      "--max-requests-jitter", "20", \
