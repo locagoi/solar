@@ -1,6 +1,5 @@
 import os
 import re
-import math
 import base64
 import httpx
 import json
@@ -14,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, Query, Depends, Header
 
 # ---------- OpenAI ----------
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 
 # ---------- Playwright ----------
 from playwright.async_api import async_playwright
@@ -272,16 +271,16 @@ async def _get_shared_browser_and_page():
             logger.info("Shared browser and page instance created")
         return _browser, _page
 
-def _get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
-    return OpenAI(api_key=api_key)
-
-async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> tuple[str, dict]:
+async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5", schema: dict | None = None) -> tuple[str, dict]:
     """
     Async variant that avoids blocking the event loop during OpenAI network I/O.
     Returns tuple of (response_text, usage_info)
+    
+    Args:
+        image_bytes: Image data as bytes
+        prompt: Analysis prompt text
+        model: OpenAI model to use
+        schema: Optional JSON schema dict for structured output (text_format)
     """
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
     try:
@@ -289,16 +288,31 @@ async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str,
         if not api_key:
             raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
         client = AsyncOpenAI(api_key=api_key)
-        resp = await client.responses.create(
-            model=model,
-            input=[{
+        
+        # Prepare API call parameters
+        api_params = {
+            "model": model,
+            "input": [{
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
                     {"type": "input_image", "image_url": data_url},
                 ],
             }],
-        )
+        }
+        
+        # Add text_format if schema is provided
+        if schema:
+            api_params["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "response_schema",
+                    "schema": schema,
+                    "strict": True
+                }
+            }
+        
+        resp = await client.responses.create(**api_params)
         
         # Extract usage information
         usage_info = {}
@@ -494,52 +508,6 @@ async def resolve_place_id_to_coords(place_id: str, api_key: str, client: httpx.
         raise HTTPException(status_code=502, detail=f"Place Details error: {data}")
     loc = data["result"]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
-
-async def fetch_static_satellite(
-    lat: float,
-    lng: float,
-    api_key: str,
-    *,
-    zoom: int = 20,
-    size_px: int = 640,
-    scale: int = 2,
-    client: httpx.AsyncClient | None = None,
-) -> bytes:
-    if size_px > 640:
-        raise HTTPException(status_code=400, detail="size_px must be <= 640; use scale=2 for higher resolution.")
-    params = {
-        "maptype": "satellite",
-        "center": f"{lat:.7f},{lng:.7f}",
-        "zoom": str(zoom),
-        "size": f"{size_px}x{size_px}",
-        "scale": str(scale),
-        "key": api_key,
-    }
-
-    close_after = False
-    if client is None:
-        client = httpx.AsyncClient(base_url=GOOGLE_BASE)
-        close_after = True
-    try:
-        r = await client.get("/staticmap", params=params, timeout=30.0)
-        r.raise_for_status()
-        if r.headers.get("Content-Type", "").startswith("application/json"):
-            logger.error("Static Maps API returned JSON error: %s", r.text)
-            raise HTTPException(status_code=502, detail=f"Static Maps API error: {r.text}")
-        return r.content
-    except httpx.HTTPStatusError as e:
-        logger.error(
-            "Static Maps HTTP error: status=%s url=%s params=%s body=%s",
-            getattr(e.response, "status_code", "?"), f"{GOOGLE_BASE}/staticmap", params, getattr(e.response, "text", ""),
-        )
-        raise HTTPException(status_code=502, detail=f"Static Maps HTTP error: {e}")
-    except httpx.RequestError as e:
-        logger.error("Static Maps request error: url=%s params=%s err=%s", f"{GOOGLE_BASE}/staticmap", params, e)
-        raise HTTPException(status_code=502, detail=f"Static Maps request error: {e}")
-    finally:
-        if close_after:
-            await client.aclose()
-
 
 # ---------- Playwright satellite capture ----------
 async def capture_satellite_with_playwright(
@@ -871,6 +839,128 @@ async def satellite(
             "token_usage": total_usage if 'total_usage' in locals() else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
         return response_data
+
+@router.get("/satellite/custom", summary="Custom satellite image analysis with user-provided prompt and schema")
+async def satellite_custom(
+    prompt: str = Query(description="Custom analysis prompt"),
+    schema: str = Query(description="JSON schema string for structured output"),
+    url: str | None = Query(default=None, description="Google Maps URL (supports @lat,lng, place_id, or q=...)"),
+    lat: float | None = Query(default=None, description="Latitude if no URL provided"),
+    lng: float | None = Query(default=None, description="Longitude if no URL provided"),
+    zoom: int = Query(default=18, ge=0, le=21),
+    size_px: int = Query(default=1000, ge=1, le=1280),
+    preview: bool = False,
+    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    token: str = Depends(verify_bearer_token),
+):
+    """
+    Custom satellite image analysis endpoint.
+    Requires prompt and schema parameters. Makes a single OpenAI call with structured output.
+    Maintains all existing functionality: Supabase upload, image capture, etc.
+    """
+    # Parse and validate schema
+    try:
+        schema_dict = json.loads(schema)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON schema: {str(e)}")
+    
+    # Figure out coordinates (reuse existing logic)
+    place_id = None
+    if url:
+        try:
+            parsed = extract_coords_from_url(url)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if isinstance(parsed, tuple) and len(parsed) == 2 and isinstance(parsed[0], float):
+            use_lat, use_lng = parsed
+        elif isinstance(parsed, tuple) and parsed[0] == "place_id":
+            # For place_id, we still need Google Maps API key
+            place_id = parsed[1]  # Store the place_id for filename
+            gkey = os.getenv("GOOGLE_MAPS_API_KEY")
+            if not gkey:
+                raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is required for place_id resolution")
+            async with httpx.AsyncClient() as c:
+                use_lat, use_lng = await resolve_place_id_to_coords(parsed[1], gkey, c)
+        else:
+            raise HTTPException(status_code=400, detail="Unrecognized URL format.")
+    else:
+        if lat is None or lng is None:
+            raise HTTPException(status_code=400, detail="Provide either 'url' or both 'lat' and 'lng'.")
+        use_lat, use_lng = float(lat), float(lng)
+
+    # Capture satellite image using Playwright
+    try:
+        img_bytes = await capture_satellite_with_playwright(
+            use_lat, use_lng,
+            zoom=zoom, size_px=size_px
+        )
+        
+        # Validate image bytes
+        if not img_bytes or len(img_bytes) == 0:
+            raise HTTPException(status_code=502, detail="Failed to capture satellite image: empty response")
+            
+    except Exception as e:
+        logger.error(f"Satellite image capture failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
+
+    # Prepare filename for Supabase upload
+    if place_id:
+        filename = f"{place_id}.png"
+    else:
+        filename = f"satellite_{use_lat:.6f}_{use_lng:.6f}.png"
+
+    if preview:
+        return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
+
+    # ⚡ PARALLEL I/O OPTIMIZATION: Run independent operations concurrently
+    tasks = []
+    
+    # 1. Upload to Supabase (background task, non-critical)
+    supabase_task = asyncio.create_task(upload_image_to_supabase(img_bytes, filename))
+    tasks.append(("supabase", supabase_task))
+    
+    # 2. Single OpenAI analysis with custom prompt and schema
+    openai_task = asyncio.create_task(
+        analyze_image_bytes_with_openai_async(img_bytes, prompt, model, schema=schema_dict)
+    )
+    tasks.append(("openai_custom", openai_task))
+    
+    # Wait for all tasks and collect results
+    text = usage = None
+    
+    for task_name, task in tasks:
+        try:
+            if task_name == "supabase":
+                await task
+            elif task_name == "openai_custom":
+                text, usage = await task
+        except Exception as e:
+            logger.error(f"{task_name} task failed: {e}")
+            if task_name == "openai_custom":
+                raise  # OpenAI analysis failure is critical
+    
+    # Parse response (should be valid JSON due to schema)
+    try:
+        if isinstance(text, str):
+            result_data = json.loads(text)
+        else:
+            result_data = text
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse OpenAI response: {e}")
+        result_data = {"raw_response": text, "parse_error": str(e)}
+    
+    # Build response (similar structure to existing endpoint)
+    response_data = {
+        "model": model,
+        "result": result_data,
+        "coordinates": {
+            "lat": use_lat,
+            "lng": use_lng
+        },
+        "token_usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    }
+    
+    return response_data
 
 @router.post("/leads", summary="Save company and person leads data")
 async def save_leads(
