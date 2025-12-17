@@ -407,11 +407,13 @@ Instructions:
 - Avoid confusing solar panels with shadows, dark rooftops, or parking lots.
 - Do not classify parking lots, ground surfaces, or sloped roofs as suitable flat rooftops.
 
+IMPORTANT: The "reasoning" field must be written entirely in German.
+
 Provide the output strictly in the following JSON format:
 {
   "solar_panels": true/false,
   "flat_surface": true/false,
-  "reasoning": "short explanation of why you answered true or false"
+  "reasoning": "kurze Erklärung auf Deutsch, warum Sie true oder false geantwortet haben"
 }"""
 
 # OpenAI prompt for solar panel suitability analysis
