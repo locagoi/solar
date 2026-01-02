@@ -860,6 +860,7 @@ async def satellite_custom(
     """
     Custom satellite image analysis endpoint.
     Requires prompt and schema parameters. Makes a single OpenAI call with structured output.
+    Maintains all existing functionality: Supabase upload, image capture, etc.
     """
     # Parse and validate schema
     try:
@@ -868,6 +869,7 @@ async def satellite_custom(
         raise HTTPException(status_code=400, detail=f"Invalid JSON schema: {str(e)}")
     
     # Figure out coordinates (reuse existing logic)
+    place_id = None
     if url:
         try:
             parsed = extract_coords_from_url(url)
@@ -877,6 +879,7 @@ async def satellite_custom(
             use_lat, use_lng = parsed
         elif isinstance(parsed, tuple) and parsed[0] == "place_id":
             # For place_id, we still need Google Maps API key
+            place_id = parsed[1]  # Store the place_id for filename
             gkey = os.getenv("GOOGLE_MAPS_API_KEY")
             if not gkey:
                 raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is required for place_id resolution")
@@ -904,15 +907,41 @@ async def satellite_custom(
         logger.error(f"Satellite image capture failed: {e}")
         raise HTTPException(status_code=502, detail=f"Failed to capture satellite image: {str(e)}")
 
+    # Prepare filename for Supabase upload
+    if place_id:
+        filename = f"{place_id}.png"
+    else:
+        filename = f"satellite_{use_lat:.6f}_{use_lng:.6f}.png"
+
     if preview:
         return StreamingResponse(BytesIO(img_bytes), media_type="image/png")
 
-    # OpenAI analysis with custom prompt and schema
-    try:
-        text, usage = await analyze_image_bytes_with_openai_async(img_bytes, prompt, model, schema=schema_dict)
-    except Exception as e:
-        logger.error(f"OpenAI analysis failed: {e}")
-        raise HTTPException(status_code=500, detail=f"OpenAI analysis failed: {str(e)}")
+    # ⚡ PARALLEL I/O OPTIMIZATION: Run independent operations concurrently
+    tasks = []
+    
+    # 1. Upload to Supabase (background task, non-critical)
+    supabase_task = asyncio.create_task(upload_image_to_supabase(img_bytes, filename))
+    tasks.append(("supabase", supabase_task))
+    
+    # 2. Single OpenAI analysis with custom prompt and schema
+    openai_task = asyncio.create_task(
+        analyze_image_bytes_with_openai_async(img_bytes, prompt, model, schema=schema_dict)
+    )
+    tasks.append(("openai_custom", openai_task))
+    
+    # Wait for all tasks and collect results
+    text = usage = None
+    
+    for task_name, task in tasks:
+        try:
+            if task_name == "supabase":
+                await task
+            elif task_name == "openai_custom":
+                text, usage = await task
+        except Exception as e:
+            logger.error(f"{task_name} task failed: {e}")
+            if task_name == "openai_custom":
+                raise  # OpenAI analysis failure is critical
     
     # Parse response (should be valid JSON due to schema)
     try:
