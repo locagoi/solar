@@ -12,8 +12,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 from fastapi.responses import StreamingResponse
 from fastapi import APIRouter, HTTPException, Query, Depends, Header
 
-# ---------- OpenAI ----------
-from openai import AsyncOpenAI
+# ---------- LLM (OpenRouter) ----------
 
 # ---------- Playwright ----------
 from playwright.async_api import async_playwright
@@ -271,122 +270,118 @@ async def _get_shared_browser_and_page():
             logger.info("Shared browser and page instance created")
         return _browser, _page
 
-async def analyze_image_bytes_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5", schema: dict | None = None) -> tuple[str, dict]:
+def _get_openrouter_config() -> tuple[str, dict]:
     """
-    Async variant that avoids blocking the event loop during OpenAI network I/O.
+    Returns (base_url, headers) for OpenRouter API calls.
+
+    Env vars:
+      - OPENROUTER_API_KEY (required)
+      - OPENROUTER_BASE_URL (optional, default https://openrouter.ai/api/v1)
+      - OPENROUTER_HTTP_REFERER (optional, recommended by OpenRouter)
+      - OPENROUTER_APP_NAME (optional, recommended by OpenRouter)
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not configured")
+
+    base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    http_referer = os.getenv("OPENROUTER_HTTP_REFERER")
+    if http_referer:
+        headers["HTTP-Referer"] = http_referer
+
+    app_name = os.getenv("OPENROUTER_APP_NAME")
+    if app_name:
+        headers["X-Title"] = app_name
+
+    return base_url, headers
+
+
+async def analyze_image_async(
+    image_bytes: bytes,
+    prompt: str,
+    model: str = "openai/gpt-5",
+    schema: dict | None = None,
+) -> tuple[str, dict]:
+    """
+    Async variant that avoids blocking the event loop during network I/O.
+    Uses OpenRouter's OpenAI-compatible API under the hood.
     Returns tuple of (response_text, usage_info)
     
     Args:
         image_bytes: Image data as bytes
         prompt: Analysis prompt text
-        model: OpenAI model to use
-        schema: Optional JSON schema dict for structured output (text_format)
+        model: OpenRouter model id (e.g. "openai/gpt-5")
+        schema: Optional JSON schema dict for structured output (response_format)
     """
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
     try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
-        client = AsyncOpenAI(api_key=api_key)
-        
-        # Prepare API call parameters
-        api_params = {
+        base_url, headers = _get_openrouter_config()
+
+        payload: dict = {
             "model": model,
-            "input": [{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
         }
-        
-        # Add text_format if schema is provided
+
+        # OpenAI-compatible JSON schema response format (best-effort; model support varies).
         if schema:
-            api_params["text"] = {
-                "format": {
-                    "type": "json_schema",
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
                     "name": "response_schema",
                     "schema": schema,
-                    "strict": True
-                }
+                    "strict": True,
+                },
             }
-        
-        resp = await client.responses.create(**api_params)
-        
-        # Extract usage information
-        usage_info = {}
-        if hasattr(resp, 'usage'):
-            # Try different possible attribute names
-            usage_info = {
-                "prompt_tokens": getattr(resp.usage, 'prompt_tokens', getattr(resp.usage, 'input_tokens', 0)),
-                "completion_tokens": getattr(resp.usage, 'completion_tokens', getattr(resp.usage, 'output_tokens', 0)),
-                "total_tokens": getattr(resp.usage, 'total_tokens', 0)
-            }
-            
-            # If we still have 0s, try to access as dictionary
-            if usage_info["prompt_tokens"] == 0 and usage_info["completion_tokens"] == 0:
-                if hasattr(resp.usage, '__dict__'):
-                    usage_dict = resp.usage.__dict__
-                    usage_info = {
-                        "prompt_tokens": usage_dict.get('prompt_tokens', usage_dict.get('input_tokens', 0)),
-                        "completion_tokens": usage_dict.get('completion_tokens', usage_dict.get('output_tokens', 0)),
-                        "total_tokens": usage_dict.get('total_tokens', 0)
-                    }
-        
-        response_text = getattr(resp, "output_text", None) or str(resp)
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            if r.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"OpenRouter HTTP {r.status_code}: {r.text}")
+            data = r.json()
+
+        choice0 = (data.get("choices") or [{}])[0]
+        msg = choice0.get("message") or {}
+        response_text = msg.get("content") or ""
+
+        u = data.get("usage") or {}
+        usage_info = {
+            "prompt_tokens": int(u.get("prompt_tokens") or 0),
+            "completion_tokens": int(u.get("completion_tokens") or 0),
+            "total_tokens": int(u.get("total_tokens") or 0),
+        }
+
         return response_text, usage_info
     except Exception as e:
-        logger.exception("OpenAI async request failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"OpenAI error: {e}")
+        logger.exception("OpenRouter request failed: %s", e)
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=502, detail=f"OpenRouter error: {e}")
 
-async def analyze_suitability_with_openai_async(image_bytes: bytes, prompt: str, model: str = "gpt-5") -> tuple[str, dict]:
+async def analyze_suitability_with_openai_async(
+    image_bytes: bytes,
+    prompt: str,
+    model: str = "openai/gpt-5",
+) -> tuple[str, dict]:
     """
-    Async variant for suitability analysis that avoids blocking the event loop during OpenAI network I/O.
+    Async variant for suitability analysis that avoids blocking the event loop during network I/O.
+    Uses OpenRouter's OpenAI-compatible API under the hood.
     Returns tuple of (response_text, usage_info)
     """
-    data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
-    try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
-        client = AsyncOpenAI(api_key=api_key)
-        resp = await client.responses.create(
-            model=model,
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }],
-        )
-        
-        # Extract usage information
-        usage_info = {}
-        if hasattr(resp, 'usage'):
-            # Try different possible attribute names
-            usage_info = {
-                "prompt_tokens": getattr(resp.usage, 'prompt_tokens', getattr(resp.usage, 'input_tokens', 0)),
-                "completion_tokens": getattr(resp.usage, 'completion_tokens', getattr(resp.usage, 'output_tokens', 0)),
-                "total_tokens": getattr(resp.usage, 'total_tokens', 0)
-            }
-            
-            # If we still have 0s, try to access as dictionary
-            if usage_info["prompt_tokens"] == 0 and usage_info["completion_tokens"] == 0:
-                if hasattr(resp.usage, '__dict__'):
-                    usage_dict = resp.usage.__dict__
-                    usage_info = {
-                        "prompt_tokens": usage_dict.get('prompt_tokens', usage_dict.get('input_tokens', 0)),
-                        "completion_tokens": usage_dict.get('completion_tokens', usage_dict.get('output_tokens', 0)),
-                        "total_tokens": usage_dict.get('total_tokens', 0)
-                    }
-        
-        response_text = getattr(resp, "output_text", None) or str(resp)
-        return response_text, usage_info
-    except Exception as e:
-        logger.exception("OpenAI suitability analysis request failed: %s", e)
-        raise HTTPException(status_code=502, detail=f"OpenAI suitability analysis error: {e}")
+    return await analyze_image_async(image_bytes, prompt, model, schema=None)
 
 # ---------- Google Maps ----------
 router = APIRouter(prefix="/maps", tags=["maps"])
@@ -666,7 +661,7 @@ async def satellite(
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
-    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-5"), description="OpenRouter model to use for analysis"),
     suitability: bool = Query(default=False, description="Analyze solar panel suitability"),
     show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
@@ -733,7 +728,7 @@ async def satellite(
     
     # 2. Main OpenAI analysis (critical)
     openai_main_task = asyncio.create_task(
-        analyze_image_bytes_with_openai_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
+        analyze_image_async(img_bytes, SATELLITE_ANALYSIS_PROMPT, model)
     )
     tasks.append(("openai_main", openai_main_task))
     
@@ -883,7 +878,7 @@ async def satellite_custom(
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
-    model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-5"), description="OpenRouter model to use for analysis"),
     show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
 ):
@@ -955,7 +950,7 @@ async def satellite_custom(
     
     # 2. Single OpenAI analysis with custom prompt and schema
     openai_task = asyncio.create_task(
-        analyze_image_bytes_with_openai_async(img_bytes, prompt, model, schema=schema_dict)
+        analyze_image_async(img_bytes, prompt, model, schema=schema_dict)
     )
     tasks.append(("openai_custom", openai_task))
     
