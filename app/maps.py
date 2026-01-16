@@ -520,10 +520,18 @@ async def capture_satellite_with_playwright(
     *,
     zoom: int = 18,
     size_px: int = 500,
+    show_marker: bool = False,
 ) -> bytes:
     """
     Capture satellite view using Playwright browser automation.
     This provides local browser control without external service dependencies.
+    
+    Args:
+        lat: Latitude coordinate
+        lng: Longitude coordinate
+        zoom: Zoom level (0-21)
+        size_px: Size of the screenshot in pixels
+        show_marker: If True, adds a red marker pin at the property location
     """
     start_time = asyncio.get_event_loop().time()
     _log_memory("START")
@@ -532,6 +540,22 @@ async def capture_satellite_with_playwright(
     google_maps_api_key = os.getenv("GOOGLE_MAPS_API_KEY")
     if not google_maps_api_key:
         raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured")
+
+    # Create marker code if requested
+    marker_code = ""
+    if show_marker:
+        # Note: avoid `{{ ... }}` here — this string is injected into the HTML as-is.
+        # Use the classic Marker API for maximum compatibility in screenshots.
+        marker_code = """
+        try {
+          new google.maps.Marker({
+            position: center,
+            map: map,
+            title: "Property Location",
+          });
+        } catch (e) {
+          console.warn("Marker init failed", e);
+        }"""
 
     # Create HTML content with the specified coordinates
     html_content = f"""<!DOCTYPE html>
@@ -559,6 +583,8 @@ async def capture_satellite_with_playwright(
           heading: 0,
           disableDefaultUI: true,
         }});
+        
+        {marker_code}
         
         // Set window.map for reliable detection
         window.map = map;
@@ -642,6 +668,7 @@ async def satellite(
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
     suitability: bool = Query(default=False, description="Analyze solar panel suitability"),
+    show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
 ):
     """
@@ -676,7 +703,7 @@ async def satellite(
     try:
         img_bytes = await capture_satellite_with_playwright(
             use_lat, use_lng,
-            zoom=zoom, size_px=size_px
+            zoom=zoom, size_px=size_px, show_marker=show_marker
         )
         
         # Validate image bytes
@@ -718,12 +745,12 @@ async def satellite(
         tasks.append(("openai_suitability", suitability_task))
     
     # Wait for all tasks and collect results
-    text = main_usage = suitability_text = suitability_usage = None
+    text = main_usage = suitability_text = suitability_usage = supabase_url = None
     
     for task_name, task in tasks:
         try:
             if task_name == "supabase":
-                await task
+                supabase_url = await task
             elif task_name == "openai_main":
                 text, main_usage = await task
             elif task_name == "openai_suitability":
@@ -829,6 +856,8 @@ async def satellite(
             },
             "token_usage": total_usage
         }
+        if supabase_url:
+            response_data["image_url"] = supabase_url
         if suitability_data:
             response_data["suitability"] = suitability_data
         return response_data
@@ -855,6 +884,7 @@ async def satellite_custom(
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
     model: str = Query(default="gpt-5", description="OpenAI model to use for analysis"),
+    show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
 ):
     """
@@ -896,7 +926,7 @@ async def satellite_custom(
     try:
         img_bytes = await capture_satellite_with_playwright(
             use_lat, use_lng,
-            zoom=zoom, size_px=size_px
+            zoom=zoom, size_px=size_px, show_marker=show_marker
         )
         
         # Validate image bytes
@@ -930,12 +960,12 @@ async def satellite_custom(
     tasks.append(("openai_custom", openai_task))
     
     # Wait for all tasks and collect results
-    text = usage = None
+    text = usage = supabase_url = None
     
     for task_name, task in tasks:
         try:
             if task_name == "supabase":
-                await task
+                supabase_url = await task
             elif task_name == "openai_custom":
                 text, usage = await task
         except Exception as e:
@@ -963,6 +993,8 @@ async def satellite_custom(
         },
         "token_usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     }
+    if supabase_url:
+        response_data["image_url"] = supabase_url
     
     return response_data
 
