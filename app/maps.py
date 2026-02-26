@@ -305,7 +305,7 @@ def _get_openrouter_config() -> tuple[str, dict]:
 async def analyze_image_async(
     image_bytes: bytes,
     prompt: str,
-    model: str = "openai/gpt-5",
+    model: str = "openai/gpt-4o",
     schema: dict | None = None,
 ) -> tuple[str, dict]:
     """
@@ -316,7 +316,7 @@ async def analyze_image_async(
     Args:
         image_bytes: Image data as bytes
         prompt: Analysis prompt text
-        model: OpenRouter model id (e.g. "openai/gpt-5")
+        model: OpenRouter model id (e.g. "openai/gpt-4o")
         schema: Optional JSON schema dict for structured output (response_format)
     """
     data_url = "data:image/png;base64," + base64.b64encode(image_bytes).decode("ascii")
@@ -374,7 +374,7 @@ async def analyze_image_async(
 async def analyze_suitability_with_openai_async(
     image_bytes: bytes,
     prompt: str,
-    model: str = "openai/gpt-5",
+    model: str = "openai/gpt-4o",
 ) -> tuple[str, dict]:
     """
     Async variant for suitability analysis that avoids blocking the event loop during network I/O.
@@ -661,7 +661,7 @@ async def satellite(
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
-    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-5"), description="OpenRouter model to use for analysis"),
+    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"), description="OpenRouter model to use for analysis"),
     suitability: bool = Query(default=False, description="Analyze solar panel suitability"),
     show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
@@ -878,7 +878,7 @@ async def satellite_custom(
     zoom: int = Query(default=18, ge=0, le=21),
     size_px: int = Query(default=1000, ge=1, le=1280),
     preview: bool = False,
-    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-5"), description="OpenRouter model to use for analysis"),
+    model: str = Query(default=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o"), description="OpenRouter model to use for analysis"),
     show_marker: bool = Query(default=False, description="Add a marker pin at the property location on the screenshot"),
     token: str = Depends(verify_bearer_token),
 ):
